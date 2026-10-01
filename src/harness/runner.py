@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -23,6 +22,7 @@ from agents import (
 )
 
 from .agents import apply_strict_policy, build_supervisor, build_workers
+from .cancel import CancelToken
 from .config import HarnessConfig
 from .progress import Emitter, ProgressHooks
 from .provider import build_model, build_model_settings
@@ -47,25 +47,6 @@ GRAPH_CONFIG_KEYS = (
     "max_turns",
     "worker_max_turns",
 )
-
-
-class CancelToken:
-    """跨线程的取消信号。
-
-    CLI 的 Ctrl+C 处理函数在信号回调里调 cancel()，跑在事件循环里的
-    轮询检查它 —— 这样取消是协作式的，运行能干净收尾并把状态存下来，
-    而不是被 KeyboardInterrupt 直接撕掉。
-    """
-
-    def __init__(self) -> None:
-        self._event = threading.Event()
-
-    def cancel(self) -> None:
-        self._event.set()
-
-    @property
-    def cancelled(self) -> bool:
-        return self._event.is_set()
 
 
 def _clip(value: Any, limit: int = 600) -> str | None:
@@ -577,4 +558,10 @@ class Harness:
         return run_dir
 
 
-__all__ = ["Harness", "RunOutcome", "render_transcript", "serialize_items"]
+__all__ = [
+    "CancelToken",
+    "Harness",
+    "RunOutcome",
+    "render_transcript",
+    "serialize_items",
+]

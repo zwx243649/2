@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import signal
 import sys
+from typing import Any
 
+from .cancel import CancelToken
 from .config import TRACING_MODES, HarnessConfig
-from .progress import ConsoleReporter
-from .runner import CancelToken, Harness, RunOutcome
 from .server import DEFAULT_PORT
 from .server import serve as serve_runs
 from .sessions import InvalidSessionId, validate_session_id
+
+# 刻意不在模块顶层 import .runner / .progress：它们会拉起整个 agents SDK，
+# 实测 6 秒。而 --help / --pending / --list-sessions / --serve 都用不到模型。
 
 NO_CREDENTIALS_HINT = (
     "还没有配置模型凭据。二选一：\n"
@@ -63,6 +66,8 @@ def _list_pending(config: HarnessConfig) -> int:
 
 def _run_resume(config: HarnessConfig, run_id: str, approve: bool, quiet: bool) -> int:
     from .runs_index import load_graph_config
+    from .progress import ConsoleReporter
+    from .runner import Harness
 
     try:
         stored = load_graph_config(config.runs_dir, run_id)
@@ -128,14 +133,15 @@ def _sigint_handler(token: CancelToken, presses: dict[str, int]):
 
 
 def _run_with_cancel(
-    harness: Harness, goal: str, session_id: str | None, quiet: bool
-) -> RunOutcome:
+    harness: Any, goal: str, session_id: str | None, quiet: bool
+) -> Any:
     """跑任务，把 Ctrl+C 变成协作式取消。
 
     直接让 KeyboardInterrupt 冒出去的话，这次运行攒下的状态会一起丢掉。
     """
     token = CancelToken()
     handler = _sigint_handler(token, {"count": 0})
+    from .progress import ConsoleReporter
 
     previous = signal.signal(signal.SIGINT, handler)
     try:
@@ -267,7 +273,7 @@ def _read_stdin_goal() -> str:
     return sys.stdin.read().strip()
 
 
-def _describe(harness: Harness) -> str:
+def _describe(harness: Any) -> str:
     config = harness.config
     lines = [
         "配置",
@@ -352,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     try:
+        from .runner import Harness
+
         harness = Harness(config)
     except Exception as exc:
         print(f"初始化失败: {exc}", file=sys.stderr)

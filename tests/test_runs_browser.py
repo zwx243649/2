@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 
 from harness.config import HarnessConfig
 from harness.runs_index import (
+    STATE_FILENAME,
     SUMMARY_FILENAME,
     RunNotFound,
     build_summary,
@@ -320,6 +322,22 @@ def _post(url: str, headers: dict | None = None):
     return urllib.request.urlopen(request, timeout=10)
 
 
+def _seed_pending(run_dir: Path) -> None:
+    """造出「有待处理状态」的痕迹，让服务认为这次运行可以续跑。"""
+    (run_dir / STATE_FILENAME).write_text("{}", encoding="utf-8")
+
+
+def _wait_for_task(base: str, timeout: float = 5.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        raw = urllib.request.urlopen(base + "/api/tasks", timeout=5).read()
+        task = json.loads(raw)["task"]
+        if task is None or task["finished"]:
+            return task
+        time.sleep(0.05)
+    raise AssertionError("任务没在预期时间内结束")
+
+
 def test_action_requires_the_custom_header(tmp_path):
     """本地服务唯一的写操作必须有 CSRF 防护。
 
@@ -338,36 +356,41 @@ def test_action_requires_the_custom_header(tmp_path):
 
 
 def test_approve_reaches_the_resume_path(tmp_path, monkeypatch):
-    write_run(tmp_path, "20260101-090000")
+    run_dir = write_run(tmp_path, "20260101-090000")
+    _seed_pending(run_dir)
     seen: list = []
 
-    def fake_resume(config, run_id, approve):
+    def fake_resume(config, run_id, approve, cancel_token=None):
         seen.append((run_id, approve))
         return _FakeOutcome()
 
     monkeypatch.setattr("harness.server._resume_run", fake_resume)
     httpd, base = _start_server(tmp_path)
     try:
-        payload = json.loads(
+        started = json.loads(
             _post(
                 base + "/api/runs/20260101-090000/approve",
                 {"X-Harness-Action": "1"},
             ).read()
         )
+        # 服务立刻返回，不等任务跑完
+        assert started["started"] is True
+        task = _wait_for_task(base)
     finally:
         httpd.shutdown()
         httpd.server_close()
 
-    assert payload["ok"] is True
-    assert payload["run_id"] == "20260101-090001"
+    assert task["outcome_run_id"] == "20260101-090001"
+    assert task["error"] is None
     assert seen == [("20260101-090000", True)]
 
 
 def test_reject_passes_approve_false(tmp_path, monkeypatch):
-    write_run(tmp_path, "20260101-090000")
+    run_dir = write_run(tmp_path, "20260101-090000")
+    _seed_pending(run_dir)
     seen: list = []
 
-    def fake_resume(config, run_id, approve):
+    def fake_resume(config, run_id, approve, cancel_token=None):
         seen.append((run_id, approve))
         return _FakeOutcome()
 
@@ -377,11 +400,69 @@ def test_reject_passes_approve_false(tmp_path, monkeypatch):
         _post(
             base + "/api/runs/20260101-090000/reject", {"X-Harness-Action": "1"}
         ).read()
+        _wait_for_task(base)
     finally:
         httpd.shutdown()
         httpd.server_close()
 
     assert seen == [("20260101-090000", False)]
+
+
+def test_tasks_endpoint_is_empty_when_idle(tmp_path):
+    httpd, base = _start_server(tmp_path)
+    try:
+        payload = json.loads(
+            urllib.request.urlopen(base + "/api/tasks", timeout=5).read()
+        )
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert payload["task"] is None
+
+
+def test_cancel_without_a_running_task_is_conflict(tmp_path):
+    write_run(tmp_path, "20260101-090000")
+    httpd, base = _start_server(tmp_path)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post(
+                base + "/api/runs/20260101-090000/cancel",
+                {"X-Harness-Action": "1"},
+            )
+        assert excinfo.value.code == 409
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_second_action_while_busy_is_conflict(tmp_path, monkeypatch):
+    """同一时刻只允许一个任务 —— 追踪状态是进程级全局的。"""
+    release = threading.Event()
+
+    def slow_resume(config, run_id, approve, cancel_token=None):
+        release.wait(timeout=5)
+        return _FakeOutcome()
+
+    monkeypatch.setattr("harness.server._resume_run", slow_resume)
+    run_dir = write_run(tmp_path, "20260101-090000")
+    _seed_pending(run_dir)
+    httpd, base = _start_server(tmp_path)
+    try:
+        _post(
+            base + "/api/runs/20260101-090000/approve", {"X-Harness-Action": "1"}
+        ).read()
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post(
+                base + "/api/runs/20260101-090000/approve",
+                {"X-Harness-Action": "1"},
+            )
+        assert excinfo.value.code == 409
+    finally:
+        release.set()
+        _wait_for_task(base)
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def test_action_on_a_non_pending_run_returns_conflict(tmp_path):

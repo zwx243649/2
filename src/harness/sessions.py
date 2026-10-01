@@ -12,8 +12,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from agents.memory.sqlite_session import SQLiteSession
-
 # 会话名会被用作数据库键，也会出现在网页 URL 里，所以限制得严一点
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 DEFAULT_DB_NAME = "sessions.db"
@@ -32,8 +30,14 @@ def validate_session_id(session_id: str) -> str:
     return session_id
 
 
-def open_conversation(session_id: str, db_path: Path) -> SQLiteSession:
-    """打开（不存在就创建）某个会话的对话历史。"""
+def open_conversation(session_id: str, db_path: Path):
+    """打开（不存在就创建）某个会话的对话历史。
+
+    SQLiteSession 在这里才导入：它属于 agents SDK，而只是想列一下会话历史的
+    命令（--list-sessions / --pending）没必要为此等 SDK 加载。
+    """
+    from agents.memory.sqlite_session import SQLiteSession
+
     validate_session_id(session_id)
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)

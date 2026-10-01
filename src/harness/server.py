@@ -8,40 +8,54 @@ from __future__ import annotations
 
 import json
 import re
-import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .config import HarnessConfig
-from .runs_index import RunNotFound, list_runs, list_sessions, load_run
+from .runs_index import (
+    STATE_FILENAME,
+    RunNotFound,
+    list_runs,
+    list_sessions,
+    load_graph_config,
+    load_run,
+)
+from .tasks import TaskRegistry
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 DEFAULT_PORT = 8765
 
-ACTION_PATTERN = re.compile(r"^/api/runs/([^/]+)/(approve|reject)$")
+ACTION_PATTERN = re.compile(r"^/api/runs/([^/]+)/(approve|reject|cancel)$")
 ACTION_HEADER = "X-Harness-Action"
 
-# 一次只允许一个写操作。Harness 的追踪开关是进程级全局状态，
-# 并发跑两个会让它们互相覆盖。
-_ACTION_LOCK = threading.Lock()
-
-
-def _resume_run(config: HarnessConfig, run_id: str, approve: bool):
+def _resume_run(config: HarnessConfig, run_id: str, approve: bool, cancel_token=None):
     """执行一次批准/拒绝。放在函数里是为了延迟导入 agents SDK ——
     只看历史的话根本不需要把它加载起来。"""
     from .runner import Harness
-    from .runs_index import load_graph_config
 
     stored = load_graph_config(config.runs_dir, run_id)
     resolved = config.with_overrides(**stored) if stored else config
 
     harness = Harness(resolved)
     try:
-        return harness.resume_sync(run_id, approve=approve)
+        return harness.resume_sync(
+            run_id, approve=approve, cancel_token=cancel_token
+        )
     finally:
         harness.close()
+
+
+def _validate_resumable(config: HarnessConfig, run_id: str) -> None:
+    """在起后台任务之前先把能查的查掉。
+
+    否则参数错误会变成「HTTP 200 然后后台静默失败」，比直接报错难查得多。
+    """
+    load_graph_config(config.runs_dir, run_id)  # 非法 id / 不存在 -> RunNotFound
+    state_path = Path(config.runs_dir) / run_id / STATE_FILENAME
+    if not state_path.is_file():
+        raise FileNotFoundError(f"{run_id} 没有可继续的状态（找不到 state.json）")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -55,6 +69,10 @@ class _Handler(BaseHTTPRequestHandler):
     @property
     def config(self) -> HarnessConfig:
         return self.server.config  # type: ignore[attr-defined]
+
+    @property
+    def tasks(self) -> TaskRegistry:
+        return self.server.tasks  # type: ignore[attr-defined]
 
     def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
@@ -81,6 +99,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(
                     {"sessions": [item.as_dict() for item in list_sessions(self.runs_dir)]}
                 )
+            elif path == "/api/tasks":
+                task = self.tasks.get()
+                self._json({"task": task.as_dict() if task else None})
             elif path.startswith("/api/runs/"):
                 run_id = unquote(path[len("/api/runs/") :])
                 self._json(load_run(self.runs_dir, run_id))
@@ -109,27 +130,35 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         run_id = unquote(match.group(1))
-        approve = match.group(2) == "approve"
+        action = match.group(2)
 
+        if action == "cancel":
+            if self.tasks.cancel(run_id):
+                self._json({"ok": True, "cancelling": True})
+            else:
+                self._json({"error": "这个运行当前没有在跑"}, 409)
+            return
+
+        approve = action == "approve"
         try:
-            with _ACTION_LOCK:
-                outcome = _resume_run(self.config, run_id, approve)
+            _validate_resumable(self.config, run_id)
         except RunNotFound as exc:
             self._json({"error": str(exc)}, 404)
+            return
         except FileNotFoundError as exc:
             self._json({"error": str(exc)}, 409)
-        except Exception as exc:
-            self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            return
+
+        def run(cancel_token):
+            return _resume_run(self.config, run_id, approve, cancel_token)
+
+        try:
+            task = self.tasks.start(run_id, f"{action} {run_id}", run)
+        except RuntimeError as exc:
+            self._json({"error": str(exc)}, 409)
         else:
-            self._json(
-                {
-                    "ok": True,
-                    "run_id": outcome.run_id,
-                    "status": outcome.status,
-                    "final_output": outcome.final_output,
-                    "pending": outcome.pending,
-                }
-            )
+            # 立刻返回。页面靠轮询 /api/tasks 看进度，也可以随时叫停。
+            self._json({"ok": True, "started": True, "task": task.as_dict()})
 
     def log_message(self, *args: Any) -> None:
         """默认会往 stderr 刷每一条请求，太吵。"""
@@ -144,6 +173,7 @@ class RunsServer(ThreadingHTTPServer):
         super().__init__((host, port), _Handler)
         self.config = config
         self.runs_dir = Path(config.runs_dir)
+        self.tasks = TaskRegistry()
 
 
 def serve(
