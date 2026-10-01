@@ -32,6 +32,7 @@ SUMMARY_KEYS = (
     "pending",
     "test_result",
     "test_command",
+    "regression_streak",
 )
 
 
@@ -74,6 +75,7 @@ class RunSummary:
     pending: list[dict[str, Any]] = field(default_factory=list)
     test_result: dict[str, Any] | None = None
     test_command: str | None = None
+    regression_streak: int = 0
 
     @property
     def display_time(self) -> str:
@@ -101,6 +103,15 @@ class SessionInfo:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class PreviousTestRun:
+    """上一次记录到的测试状况。"""
+
+    result: dict[str, Any]
+    command: str | None = None
+    regression_streak: int = 0
 
 
 def _safe_run_dir(runs_dir: Path, run_id: str) -> Path:
@@ -186,6 +197,7 @@ def summarize_run(
     pending = data.get("pending") if resumable else []
     test_result = data.get("test_result")
     test_command = data.get("test_command")
+    streak = data.get("regression_streak")
     if not resumable:
         status = "completed"
     else:
@@ -201,6 +213,7 @@ def summarize_run(
         pending=pending if isinstance(pending, list) else [],
         test_result=test_result if isinstance(test_result, dict) else None,
         test_command=str(test_command) if test_command else None,
+        regression_streak=int(streak or 0),
         **usage,
     )
 
@@ -307,13 +320,14 @@ def discard_run(runs_dir: Path, run_id: str) -> None:
 
 def previous_test_result(
     runs_dir: Path, run_id: str
-) -> tuple[dict[str, Any], str | None] | None:
+) -> PreviousTestRun | None:
     """沿着 resumed_from 往回找最近一次记录到的测试结果。
 
     每次 resume 都是一次全新的运行，彼此不知道对方 —— 上一次的失败数
     只能从记录链里捞回来，否则「越改越糟」根本无从判断。
 
-    连当时用的命令一起返回：不同范围的测试（单文件 vs 全量）不能直接比。
+    连当时用的命令和「连续退步次数」一起返回：不同范围的测试不能直接比，
+    而计数器不跨 resume 的话，永远也攒不到叫停的阈值。
     """
     runs_dir = Path(runs_dir)
     seen: set[str] = set()
@@ -331,7 +345,11 @@ def previous_test_result(
         result = data.get("test_result")
         if isinstance(result, dict):
             command = data.get("test_command")
-            return result, str(command) if command else None
+            return PreviousTestRun(
+                result=result,
+                command=str(command) if command else None,
+                regression_streak=int(data.get("regression_streak", 0) or 0),
+            )
         current = data.get("resumed_from")
     return None
 
@@ -343,6 +361,7 @@ __all__ = [
     "RunNotFound",
     "RunSummary",
     "SessionInfo",
+    "PreviousTestRun",
     "build_summary",
     "discard_run",
     "list_runs",

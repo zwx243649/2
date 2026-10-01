@@ -187,10 +187,12 @@ def test_previous_test_result_reads_the_run_itself(tmp_path):
         {"test_result": {"failed": 2}, "test_command": "pytest -q"},
     )
 
-    assert previous_test_result(tmp_path, "20260101-090000") == (
-        {"failed": 2},
-        "pytest -q",
-    )
+    previous = previous_test_result(tmp_path, "20260101-090000")
+
+    assert previous is not None
+    assert previous.result == {"failed": 2}
+    assert previous.command == "pytest -q"
+    assert previous.regression_streak == 0
 
 
 def test_previous_test_result_walks_the_resume_chain(tmp_path):
@@ -203,10 +205,11 @@ def test_previous_test_result_walks_the_resume_chain(tmp_path):
     _write_run(tmp_path, "20260101-090100", {"resumed_from": "20260101-090000"})
     _write_run(tmp_path, "20260101-090200", {"resumed_from": "20260101-090100"})
 
-    assert previous_test_result(tmp_path, "20260101-090200") == (
-        {"failed": 2},
-        "pytest -q",
-    )
+    previous = previous_test_result(tmp_path, "20260101-090200")
+
+    assert previous is not None
+    assert previous.result == {"failed": 2}
+    assert previous.command == "pytest -q"
 
 
 def test_previous_test_result_stops_at_the_nearest_one(tmp_path):
@@ -225,10 +228,29 @@ def test_previous_test_result_stops_at_the_nearest_one(tmp_path):
         },
     )
 
-    assert previous_test_result(tmp_path, "20260101-090100") == (
-        {"failed": 13},
-        "pytest tests/ -q",
+    previous = previous_test_result(tmp_path, "20260101-090100")
+
+    assert previous is not None
+    assert previous.result == {"failed": 13}
+    assert previous.command == "pytest tests/ -q"
+
+
+def test_previous_test_result_carries_the_regression_streak(tmp_path):
+    """这一个不跨 resume 的话，永远攒不到叫停的阈值。"""
+    _write_run(
+        tmp_path,
+        "20260101-090000",
+        {
+            "test_result": {"failed": 3},
+            "test_command": "pytest -q",
+            "regression_streak": 1,
+        },
     )
+
+    previous = previous_test_result(tmp_path, "20260101-090000")
+
+    assert previous is not None
+    assert previous.regression_streak == 1
 
 
 def test_previous_test_result_survives_a_broken_link(tmp_path):

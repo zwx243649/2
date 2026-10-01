@@ -389,11 +389,13 @@ class Harness:
         # 也就判断不出有没有变差。
         previous = previous_test_result(self.config.runs_dir, run_id)
         if previous is not None:
-            result, command = previous
-            self.test_results.previous = result
-            self.test_results.latest = result
-            self.test_results.previous_command = command
-            self.test_results.latest_command = command
+            self.test_results.previous = previous.result
+            self.test_results.latest = previous.result
+            self.test_results.previous_command = previous.command
+            self.test_results.latest_command = previous.command
+            # 连续退步的计数也要接着数 —— 每次 resume 都是新的 Harness，
+            # 不接着数的话永远攒不到叫停的阈值。
+            self.test_results.consecutive_regressions = previous.regression_streak
 
         state_text = state_path.read_text(encoding="utf-8")
         state_payload = json.loads(state_text)
@@ -588,6 +590,7 @@ class Harness:
             "graph_config": self._graph_config(),
             "test_result": self.test_results.latest,
             "test_command": self.test_results.latest_command,
+            "regression_streak": self.test_results.consecutive_regressions,
         }
         (run_dir / "run.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
