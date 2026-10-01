@@ -13,32 +13,65 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from harness import Harness, HarnessConfig
 
 
-def _chat_response(message: dict, finish_reason: str = "stop") -> dict:
+def _chunk(delta: dict, finish_reason: str | None = None) -> dict:
     return {
         "id": "chatcmpl-test",
-        "object": "chat.completion",
+        "object": "chat.completion.chunk",
         "created": 1_700_000_000,
         "model": "deepseek-flash",
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+
+
+def _usage_chunk() -> dict:
+    return {
+        "id": "chatcmpl-test",
+        "object": "chat.completion.chunk",
+        "created": 1_700_000_000,
+        "model": "deepseek-flash",
+        "choices": [],
         "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
     }
 
 
-def _tool_call(name: str, arguments: dict, call_id: str) -> dict:
-    return _chat_response(
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": name, "arguments": json.dumps(arguments)},
-                }
-            ],
-        },
-        finish_reason="tool_calls",
-    )
+def chat_stream(text: str) -> list[dict]:
+    """一段纯文本回复的 SSE 分片。"""
+    return [
+        _chunk({"role": "assistant", "content": text}),
+        _chunk({}, "stop"),
+    ]
+
+
+def tool_stream(name: str, arguments: dict, call_id: str) -> list[dict]:
+    """一次工具调用的 SSE 分片。"""
+    return [
+        _chunk(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(arguments),
+                        },
+                    }
+                ],
+            }
+        ),
+        _chunk({}, "tool_calls"),
+    ]
+
+
+def to_sse(chunks: list[dict], *, include_usage: bool) -> bytes:
+    """真正的 Chat Completions 流是 SSE，不是一次性 JSON。"""
+    lines = [f"data: {json.dumps(chunk)}\n\n" for chunk in chunks]
+    if include_usage:
+        lines.append(f"data: {json.dumps(_usage_chunk())}\n\n")
+    lines.append("data: [DONE]\n\n")
+    return "".join(lines).encode("utf-8")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -49,11 +82,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         index = len(self.server.requests) - 1
         script = self.server.responses
-        payload = script[index] if index < len(script) else script[-1]
-        raw = json.dumps(payload).encode("utf-8")
+        chunks = script[index] if index < len(script) else script[-1]
+        include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+        raw = to_sse(chunks, include_usage=include_usage)
 
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -91,9 +125,9 @@ class FakeEndpoint:
 
 async def test_deepseek_style_endpoint_drives_the_whole_flow(tmp_path):
     responses = [
-        _tool_call("researcher", {"input": "看看工作区"}, "call_1"),
-        _chat_response({"role": "assistant", "content": "工作区是空的。"}),
-        _chat_response({"role": "assistant", "content": "结论：工作区为空。"}),
+        tool_stream("researcher", {"input": "看看工作区"}, "call_1"),
+        chat_stream("工作区是空的。"),
+        chat_stream("结论：工作区为空。"),
     ]
 
     with FakeEndpoint(responses) as endpoint:
@@ -125,7 +159,7 @@ async def test_deepseek_gets_non_strict_tool_schemas(tmp_path):
     注意 as_tool() 生成的 worker 工具会强制 strict_json_schema=True，
     必须靠 apply_strict_policy 在构造后覆盖掉。
     """
-    responses = [_chat_response({"role": "assistant", "content": "ok"})]
+    responses = [chat_stream("ok")]
 
     with FakeEndpoint(responses) as endpoint:
         config = HarnessConfig(
@@ -149,7 +183,7 @@ async def test_deepseek_gets_non_strict_tool_schemas(tmp_path):
 
 async def test_thinking_can_be_disabled_for_deepseek(tmp_path):
     """HARNESS_THINKING=disabled 应该真的通过 extra_body 发出去。"""
-    responses = [_chat_response({"role": "assistant", "content": "ok"})]
+    responses = [chat_stream("ok")]
 
     with FakeEndpoint(responses) as endpoint:
         config = HarnessConfig(
@@ -167,7 +201,7 @@ async def test_thinking_can_be_disabled_for_deepseek(tmp_path):
 
 async def test_unsupported_parameters_are_not_sent(tmp_path):
     """确认没有把 DeepSeek 不认的参数发出去。"""
-    responses = [_chat_response({"role": "assistant", "content": "ok"})]
+    responses = [chat_stream("ok")]
 
     with FakeEndpoint(responses) as endpoint:
         config = HarnessConfig(

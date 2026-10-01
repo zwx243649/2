@@ -109,7 +109,7 @@ async def test_resume_without_state_is_rejected(tmp_path):
     outcome = await harness.run("创建一个 marker 文件")
     (outcome.run_dir / STATE_FILENAME).unlink()
 
-    with pytest.raises(FileNotFoundError, match="没有待批准"):
+    with pytest.raises(FileNotFoundError, match="没有可继续的状态"):
         await harness.resume(outcome.run_id, approve=True)
 
 
@@ -154,6 +154,7 @@ def test_status_is_derived_from_the_state_file(tmp_path):
     """status 从 state.json 是否存在推导，文件里存的那个值不作数。
 
     否则续跑之后 state.json 被删了，文件里那句 "paused" 就会一直留着说谎。
+    三种情况：没状态=完成，有状态且有待批准=暂停，有状态但没待批准=被停止。
     """
     runs_dir = tmp_path / "runs"
     run_dir = runs_dir / "20260101-090000"
@@ -166,6 +167,18 @@ def test_status_is_derived_from_the_state_file(tmp_path):
     assert list_runs(runs_dir)[0].status == "completed"
 
     (run_dir / STATE_FILENAME).write_text("{}", encoding="utf-8")
+    # 有状态但没有待批准项 —— 是被停止的，不是等批准
+    assert list_runs(runs_dir)[0].status == "cancelled"
+
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "goal": "x",
+                "pending": [{"tool": "run_command", "arguments": "{}"}],
+            }
+        ),
+        encoding="utf-8",
+    )
     assert list_runs(runs_dir)[0].status == "paused"
 
     (run_dir / STATE_FILENAME).unlink()

@@ -64,7 +64,10 @@ class RunSummary:
     cached_tokens: int
     total_tokens: int
     session_id: str | None = None
-    # 由 state.json 是否存在推导，不存进文件，避免和实际状态脱节
+    # 由 state.json 是否存在推导，不存进文件，避免和实际状态脱节：
+    #   completed —— 没留下状态，跑完了
+    #   paused    —— 有状态且有待批准的工具调用
+    #   cancelled —— 有状态但没有待批准项，是被停止的，可以续跑
     status: str = "completed"
     pending: list[dict[str, Any]] = field(default_factory=list)
 
@@ -170,13 +173,17 @@ def _normalize_spans(spans: list[Any]) -> list[dict[str, Any]]:
 
 
 def summarize_run(
-    run_id: str, data: dict[str, Any], *, paused: bool = False
+    run_id: str, data: dict[str, Any], *, resumable: bool = False
 ) -> RunSummary:
     usage = _extract_usage(data)
     session_id = data.get("session_id")
     # pending 也必须跟着状态走：它是落盘时的快照，运行被批准/拒绝解决之后
     # state.json 就没了，再回放那份快照会出现「已完成却还挂着一个待批准」。
-    pending = data.get("pending") if paused else []
+    pending = data.get("pending") if resumable else []
+    if not resumable:
+        status = "completed"
+    else:
+        status = "paused" if pending else "cancelled"
     return RunSummary(
         run_id=run_id,
         goal=str(data.get("goal", "")),
@@ -184,7 +191,7 @@ def summarize_run(
         duration_s=float(data.get("duration_s", 0.0) or 0.0),
         model_calls=int(data.get("model_calls", 0) or 0),
         session_id=str(session_id) if session_id else None,
-        status="paused" if paused else "completed",
+        status=status,
         pending=pending if isinstance(pending, list) else [],
         **usage,
     )
@@ -205,7 +212,7 @@ def list_runs(runs_dir: Path) -> list[RunSummary]:
                 summarize_run(
                     entry.name,
                     _read_summary(entry),
-                    paused=(entry / STATE_FILENAME).is_file(),
+                    resumable=(entry / STATE_FILENAME).is_file(),
                 )
             )
         except (RunNotFound, json.JSONDecodeError, OSError):
@@ -244,8 +251,8 @@ def list_sessions(runs_dir: Path) -> list[SessionInfo]:
 
 
 def list_pending(runs_dir: Path) -> list[RunSummary]:
-    """还没处理完的暂停运行（有新到旧的顺序）。"""
-    return [item for item in list_runs(runs_dir) if item.status == "paused"]
+    """还没处理完的运行：等批准的，和停下来的（有新到旧）。"""
+    return [item for item in list_runs(runs_dir) if item.status != "completed"]
 
 
 def load_run(runs_dir: Path, run_id: str) -> dict[str, Any]:
@@ -254,7 +261,7 @@ def load_run(runs_dir: Path, run_id: str) -> dict[str, Any]:
     data = _read_payload(run_dir)
 
     summary = summarize_run(
-        run_id, data, paused=(run_dir / STATE_FILENAME).is_file()
+        run_id, data, resumable=(run_dir / STATE_FILENAME).is_file()
     )
     return {
         "summary": summary.as_dict(),

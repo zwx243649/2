@@ -62,6 +62,8 @@
   .row.baseline { border-left-color: var(--good); }
   .row.paused { background: #fffbf0; border-left-color: #d97706; }
   .row.paused.active { background: #fef3e2; }
+  .row.cancelled { background: #f7f8fa; border-left-color: #94a3b8; }
+  .row.cancelled.active { background: #eef1f5; }
   .row .goal {
     font-size: 12.5px; overflow: hidden; text-overflow: ellipsis;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
@@ -74,6 +76,9 @@
   .tag.pending {
     background: #fef3e2; color: #b45309; border-color: #f5d9a8;
     font-weight: 600;
+  }
+  .tag.stopped {
+    background: #eef1f5; color: #475569; border-color: #d5dbe4;
   }
 
   .detail { overflow-y: auto; padding: 14px 18px 40px; }
@@ -193,23 +198,25 @@ async function loadRuns(autoSelect = true) {
   sessions = (await sessRes.json()).sessions;
   const total = runs.reduce((s, r) => s + r.total_tokens, 0);
   const waiting = runs.filter((r) => r.status === "paused").length;
+  const stopped = runs.filter((r) => r.status === "cancelled").length;
+  const open = waiting + stopped;
   $("agg").textContent = `${runs.length} 次运行 · 合计 ${fmt(total)} tokens` +
-    (waiting ? ` · ${waiting} 个待批准` : "");
+    (open ? ` · ${open} 个待处理` : "");
   renderFilters();
   renderList();
   if (autoSelect && runs.length) selectRun(runs[0].run_id);
 }
 
 function renderFilters() {
-  const pendingCount = runs.filter((r) => r.status === "paused").length;
+  const openRuns = runs.filter((r) => r.status !== "completed");
   const chips = [`<span class="chip ${filter.type === "all" ? "on" : ""}"
     data-kind="all" data-value="">全部 <span class="n">${runs.length}</span></span>`];
 
-  if (pendingCount) {
+  if (openRuns.length) {
     chips.push(`<span class="chip ${filter.type === "pending" ? "on" : ""}"
       data-kind="pending" data-value=""
-      style="border-color:#f5d9a8;color:#b45309">待批准
-      <span class="n">${pendingCount}</span></span>`);
+      style="border-color:#f5d9a8;color:#b45309">待处理
+      <span class="n">${openRuns.length}</span></span>`);
   }
 
   for (const s of sessions) {
@@ -230,7 +237,9 @@ function renderFilters() {
 }
 
 function visibleRuns() {
-  if (filter.type === "pending") return runs.filter((r) => r.status === "paused");
+  if (filter.type === "pending") {
+    return runs.filter((r) => r.status !== "completed");
+  }
   if (filter.type === "session") {
     return runs.filter((r) => r.session_id === filter.value);
   }
@@ -245,9 +254,11 @@ function renderList() {
   }
   $("list").innerHTML = visible.map((r) => {
     const paused = r.status === "paused";
+    const stopped = r.status === "cancelled";
     const cls = [
       "row",
       paused ? "paused" : "",
+      stopped ? "cancelled" : "",
       r.run_id === selectedId ? "active" : "",
       r.run_id === baselineId ? "baseline" : "",
     ].join(" ");
@@ -255,9 +266,12 @@ function renderList() {
     const sess = r.session_id && filter.type !== "session"
       ? `<span class="tag" style="background:#eef4ff;color:var(--accent);border-color:#dbe6ff">${esc(r.session_id)}</span>`
       : "";
-    const waiting = paused && r.pending && r.pending.length
-      ? `<span class="tag pending">待批准 ${esc(r.pending[0].tool || "")}</span>`
-      : "";
+    let stateTag = "";
+    if (paused && r.pending && r.pending.length) {
+      stateTag = `<span class="tag pending">待批准 ${esc(r.pending[0].tool || "")}</span>`;
+    } else if (stopped) {
+      stateTag = '<span class="tag stopped">已停止</span>';
+    }
     return `<div class="${cls}" data-id="${esc(r.run_id)}">
       <div class="goal">${esc(r.goal)}</div>
       <div class="meta">
@@ -266,7 +280,7 @@ function renderList() {
         <span class="num">${fmt(r.total_tokens)} tok</span>
         <span class="num">${r.duration_s.toFixed(1)}s</span>
         ${tag}
-        ${waiting}
+        ${stateTag}
         ${sess}
       </div>
     </div>`;
@@ -323,6 +337,18 @@ function renderDetail(data) {
       </div>`
     : "";
 
+  const stoppedBlock = s.status === "cancelled"
+    ? `<div class="baseline-bar" style="background:#f7f8fa;border-color:#d5dbe4">
+        <div style="flex:1">
+          <b style="color:#475569">⏹ 这次运行被停止了</b>
+          <div style="margin-top:6px;color:var(--muted);font-size:11.5px">
+            状态已经存下来了，在终端里接着跑：
+            <code>python -m harness --resume ${esc(s.run_id)}</code>
+          </div>
+        </div>
+      </div>`
+    : "";
+
   const steps = data.transcript.map((e, i) => {
     const kind = e.kind === "ToolCallItem" ? '<span class="kind delegate">委派</span>'
       : e.kind === "ToolCallOutputItem" ? '<span class="kind return">回传</span>'
@@ -348,6 +374,7 @@ function renderDetail(data) {
   $("detail").innerHTML = `
     ${bar}
     ${pendingBlock}
+    ${stoppedBlock}
     <h2>${esc(s.goal)}</h2>
     <div class="meta" style="color:var(--muted);font-size:12px">
       <span class="num">${esc(s.display_time)}</span> ·

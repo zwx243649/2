@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 
 from .config import TRACING_MODES, HarnessConfig
 from .progress import ConsoleReporter
-from .runner import Harness
+from .runner import CancelToken, Harness, RunOutcome
 from .server import DEFAULT_PORT
 from .server import serve as serve_runs
 from .sessions import InvalidSessionId, validate_session_id
@@ -48,11 +49,15 @@ def _list_pending(config: HarnessConfig) -> int:
         return 0
 
     for item in items:
-        print(f"{item.run_id}  {item.display_time}  {item.goal[:50]}")
+        label = "等批准" if item.status == "paused" else "已停止"
+        print(f"{item.run_id}  [{label}]  {item.display_time}  {item.goal[:44]}")
         for call in item.pending:
             print(f"    待批准 [{call.get('tool')}] {call.get('arguments')}")
-        print(f"    批准: python -m harness --approve {item.run_id}")
-        print(f"    拒绝: python -m harness --reject {item.run_id}")
+        if item.status == "paused":
+            print(f"    批准: python -m harness --approve {item.run_id}")
+            print(f"    拒绝: python -m harness --reject {item.run_id}")
+        else:
+            print(f"    继续: python -m harness --resume {item.run_id}")
     return 0
 
 
@@ -99,6 +104,49 @@ def _run_resume(config: HarnessConfig, run_id: str, approve: bool, quiet: bool) 
 
 def _has_credentials(config: HarnessConfig) -> bool:
     return config.resolved_api_key is not None or config.base_url is not None
+
+
+def _sigint_handler(token: CancelToken, presses: dict[str, int]):
+    """把 Ctrl+C 转成取消信号。
+
+    第一次按：设置取消信号，让运行自己收尾（状态会留下来，之后能 --resume）。
+    第二次按：恢复默认行为并抛 KeyboardInterrupt，用于运行卡死时强退。
+
+    单独抽出来是为了能确定性地测试 —— 真实的控制台事件没法在自动化里可靠地造。
+    """
+
+    def handler(signum: int, frame: object) -> None:
+        presses["count"] += 1
+        if presses["count"] == 1:
+            token.cancel()
+            print("\n正在停止…（再按一次 Ctrl+C 强制退出）", file=sys.stderr)
+        else:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            raise KeyboardInterrupt
+
+    return handler
+
+
+def _run_with_cancel(
+    harness: Harness, goal: str, session_id: str | None, quiet: bool
+) -> RunOutcome:
+    """跑任务，把 Ctrl+C 变成协作式取消。
+
+    直接让 KeyboardInterrupt 冒出去的话，这次运行攒下的状态会一起丢掉。
+    """
+    token = CancelToken()
+    handler = _sigint_handler(token, {"count": 0})
+
+    previous = signal.signal(signal.SIGINT, handler)
+    try:
+        return harness.run_sync(
+            goal,
+            session_id=session_id,
+            on_event=None if quiet else ConsoleReporter(),
+            cancel_token=token,
+        )
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 def _serve(config: HarnessConfig, port: int) -> int:
@@ -197,6 +245,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="拒绝该工具调用，并继续运行",
     )
     parser.add_argument(
+        "--resume",
+        metavar="RUN_ID",
+        help="继续一次被停止（或已批准）的运行",
+    )
+    parser.add_argument(
         "--quiet",
         "-q",
         action="store_true",
@@ -285,6 +338,12 @@ def main(argv: list[str] | None = None) -> int:
             config, action, approve=bool(args.approve), quiet=args.quiet
         )
 
+    if args.resume:
+        if not _has_credentials(config):
+            print(NO_CREDENTIALS_HINT, file=sys.stderr)
+            return 2
+        return _run_resume(config, args.resume, approve=True, quiet=args.quiet)
+
     if args.session:
         try:
             validate_session_id(args.session)
@@ -312,10 +371,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         # 进度走 stderr，最终报告走 stdout，方便 `> result.txt` 重定向
-        reporter = None if args.quiet else ConsoleReporter()
-        outcome = harness.run_sync(
-            goal, session_id=args.session, on_event=reporter
-        )
+        outcome = _run_with_cancel(harness, goal, args.session, args.quiet)
     except KeyboardInterrupt:
         print("\n已中断。", file=sys.stderr)
         return 130

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -46,6 +47,25 @@ GRAPH_CONFIG_KEYS = (
     "max_turns",
     "worker_max_turns",
 )
+
+
+class CancelToken:
+    """跨线程的取消信号。
+
+    CLI 的 Ctrl+C 处理函数在信号回调里调 cancel()，跑在事件循环里的
+    轮询检查它 —— 这样取消是协作式的，运行能干净收尾并把状态存下来，
+    而不是被 KeyboardInterrupt 直接撕掉。
+    """
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
 
 
 def _clip(value: Any, limit: int = 600) -> str | None:
@@ -153,6 +173,23 @@ class RunOutcome:
         return summarize_usage(self.spans)
 
     def render(self, *, verbose: bool = False) -> str:
+        if self.status == "cancelled":
+            return "\n".join(
+                [
+                    "=" * 60,
+                    f"目标\n{self.goal}",
+                    "-" * 60,
+                    "⏹ 已停止（这次没有跑完）",
+                    "",
+                    "状态已经存下来了，可以接着跑：",
+                    f"  python -m harness --resume {self.run_id or '(见运行目录)'}",
+                    "-" * 60,
+                    f"消耗: {self.usage.render()}",
+                    f"运行产物: {self.run_dir}",
+                    "=" * 60,
+                ]
+            )
+
         if self.status == "paused":
             head = [
                 "=" * 60,
@@ -251,11 +288,13 @@ class Harness:
         *,
         session_id: str | None = None,
         on_event: Emitter | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> RunOutcome:
         """跑一次任务。
 
         - ``on_event``：实时进度回调
         - ``session_id``：带上它就能复用同名会话的历史，实现多轮追问
+        - ``cancel_token``：发出取消信号后本轮会干净收尾，并把状态存下来供续跑
         """
         goal = (goal or "").strip()
         if not goal:
@@ -265,43 +304,18 @@ class Harness:
         self.processor.reset()
         started = time.perf_counter()
 
-        self.progress.set_emitter(on_event)
-        try:
-            result = await Runner.run(
-                self.supervisor,
-                goal,
-                max_turns=self.config.max_turns,
-                hooks=self.progress,
-                session=session,
-                run_config=RunConfig(
-                    workflow_name=WORKFLOW_NAME,
-                    # local 模式数据不出本机，保留完整内容便于调试；
-                    # openai 模式要上传，先脱敏。
-                    trace_include_sensitive_data=self.config.tracing != "openai",
-                ),
-            )
-        finally:
-            self.progress.set_emitter(None)
-
-        duration = time.perf_counter() - started
-        interruptions = list(result.interruptions)
-        outcome = RunOutcome(
-            goal=goal,
-            final_output="" if interruptions else str(result.final_output),
-            last_agent=result.last_agent.name,
-            duration_s=duration,
-            transcript=serialize_items(result),
-            spans=list(self.processor.spans),
-            timeline=self.processor.format_timeline(),
-            session_id=session_id,
-            status="paused" if interruptions else "completed",
-            pending=describe_interruptions(interruptions),
+        result, cancelled = await self._execute(
+            goal, session=session, cancel_token=cancel_token, on_event=on_event
         )
 
-        if self.config.save_artifacts:
-            outcome.run_dir = self._persist(outcome, result)
-            outcome.run_id = outcome.run_dir.name
-        return outcome
+        outcome = self._build_outcome(
+            goal,
+            result,
+            cancelled,
+            time.perf_counter() - started,
+            session_id=session_id,
+        )
+        return self._finish(outcome, result)
 
     def run_sync(
         self,
@@ -309,8 +323,16 @@ class Harness:
         *,
         session_id: str | None = None,
         on_event: Emitter | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> RunOutcome:
-        return asyncio.run(self.run(goal, session_id=session_id, on_event=on_event))
+        return asyncio.run(
+            self.run(
+                goal,
+                session_id=session_id,
+                on_event=on_event,
+                cancel_token=cancel_token,
+            )
+        )
 
     def resume_sync(
         self,
@@ -318,8 +340,16 @@ class Harness:
         *,
         approve: bool = True,
         on_event: Emitter | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> RunOutcome:
-        return asyncio.run(self.resume(run_id, approve=approve, on_event=on_event))
+        return asyncio.run(
+            self.resume(
+                run_id,
+                approve=approve,
+                on_event=on_event,
+                cancel_token=cancel_token,
+            )
+        )
 
     async def resume(
         self,
@@ -327,24 +357,20 @@ class Harness:
         *,
         approve: bool = True,
         on_event: Emitter | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> RunOutcome:
-        """从暂停的运行继续。approve=True 放行待批准的调用，False 则拒绝它。"""
+        """从暂停或被停止的运行继续。
+
+        approve=True 放行待批准的调用，False 则拒绝；被停止的运行没有待批准项，
+        两个值都只是继续往下跑。
+        """
         run_dir = self.config.runs_dir / run_id
         state_path = run_dir / STATE_FILENAME
         if not state_path.is_file():
-            raise FileNotFoundError(f"{run_id} 没有待批准的调用（找不到 state.json）")
+            raise FileNotFoundError(f"{run_id} 没有可继续的状态（找不到 state.json）")
 
         original = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-        stored_graph = original.get("graph_config")
-        if isinstance(stored_graph, dict):
-            current = self._graph_config()
-            diff = {
-                key: {"原运行": stored_graph.get(key), "当前": current.get(key)}
-                for key in GRAPH_CONFIG_KEYS
-                if key in stored_graph and stored_graph.get(key) != current.get(key)
-            }
-            if diff:
-                raise ValueError(f"续跑需要和原运行相同的工具配置，但不一致：{diff}")
+        self._check_graph_config(original)
 
         state = await RunState.from_string(
             self.supervisor, state_path.read_text(encoding="utf-8")
@@ -357,44 +383,111 @@ class Harness:
 
         self.processor.reset()
         started = time.perf_counter()
-        self.progress.set_emitter(on_event)
-        try:
-            result = await Runner.run(
-                self.supervisor,
-                state,
-                max_turns=self.config.max_turns,
-                hooks=self.progress,
-                run_config=RunConfig(
-                    workflow_name=WORKFLOW_NAME,
-                    trace_include_sensitive_data=self.config.tracing != "openai",
-                ),
-            )
-        finally:
-            self.progress.set_emitter(None)
+        result, cancelled = await self._execute(
+            state, session=None, cancel_token=cancel_token, on_event=on_event
+        )
 
         # 续跑成功后才清掉待处理标记；失败的话状态还在，可以重试
         state_path.unlink(missing_ok=True)
 
-        duration = time.perf_counter() - started
+        outcome = self._build_outcome(
+            str(original.get("goal", "")),
+            result,
+            cancelled,
+            time.perf_counter() - started,
+            session_id=original.get("session_id"),
+            resumed_from=run_id,
+        )
+        return self._finish(outcome, result)
+
+    async def _execute(
+        self,
+        agent_input: Any,
+        *,
+        session: Any,
+        cancel_token: CancelToken | None,
+        on_event: Emitter | None,
+    ) -> tuple[RunResult, bool]:
+        """跑一轮，返回 (结果, 是否被取消)。
+
+        用 run_streamed 而不是 run：只有它能在中途取消，同步的 run 没有任何
+        中断入口。取消是协作式的 —— 轮询到信号后调 cancel()，运行会自己收尾，
+        状态留在 result 里，之后可以续跑。
+        """
+        self.progress.set_emitter(on_event)
+        try:
+            result = Runner.run_streamed(
+                self.supervisor,
+                agent_input,
+                max_turns=self.config.max_turns,
+                hooks=self.progress,
+                session=session,
+                run_config=RunConfig(
+                    workflow_name=WORKFLOW_NAME,
+                    # local 模式数据不出本机，保留完整内容便于调试；
+                    # openai 模式要上传，先脱敏。
+                    trace_include_sensitive_data=self.config.tracing != "openai",
+                ),
+            )
+            cancelled = False
+            async for _event in result.stream_events():
+                if not cancelled and cancel_token is not None and cancel_token.cancelled:
+                    cancelled = True
+                    result.cancel()
+            return result, cancelled
+        finally:
+            self.progress.set_emitter(None)
+
+    def _build_outcome(
+        self,
+        goal: str,
+        result: RunResult,
+        cancelled: bool,
+        duration: float,
+        *,
+        session_id: str | None = None,
+        resumed_from: str | None = None,
+    ) -> RunOutcome:
         interruptions = list(result.interruptions)
-        outcome = RunOutcome(
-            goal=str(original.get("goal", "")),
-            final_output="" if interruptions else str(result.final_output),
+        if interruptions:
+            status = "paused"
+        elif cancelled:
+            status = "cancelled"
+        else:
+            status = "completed"
+
+        return RunOutcome(
+            goal=goal,
+            final_output="" if status != "completed" else str(result.final_output),
             last_agent=result.last_agent.name,
             duration_s=duration,
             transcript=serialize_items(result),
             spans=list(self.processor.spans),
             timeline=self.processor.format_timeline(),
-            session_id=original.get("session_id"),
-            status="paused" if interruptions else "completed",
+            session_id=session_id,
+            status=status,
             pending=describe_interruptions(interruptions),
-            resumed_from=run_id,
+            resumed_from=resumed_from,
         )
 
+    def _finish(self, outcome: RunOutcome, result: RunResult) -> RunOutcome:
         if self.config.save_artifacts:
             outcome.run_dir = self._persist(outcome, result)
             outcome.run_id = outcome.run_dir.name
         return outcome
+
+    def _check_graph_config(self, original: dict[str, Any]) -> None:
+        stored = original.get("graph_config")
+        if not isinstance(stored, dict):
+            return
+        current = self._graph_config()
+        diff = {
+            key: {"原运行": stored.get(key), "当前": current.get(key)}
+            for key in GRAPH_CONFIG_KEYS
+            if key in stored and stored.get(key) != current.get(key)
+        }
+        if diff:
+            raise ValueError(f"续跑需要和原运行相同的工具配置，但不一致：{diff}")
 
     def _conversation(self, session_id: str) -> Any:
         """同一个会话只打开一次，避免重复建连接。"""
@@ -474,8 +567,8 @@ class Harness:
             encoding="utf-8",
             newline="\n",
         )
-        if outcome.status == "paused":
-            # 完整运行状态，用于之后从暂停点继续
+        if outcome.status in ("paused", "cancelled"):
+            # 完整运行状态：暂停时用来批准后继续，被停止时用来续跑
             (run_dir / STATE_FILENAME).write_text(
                 result.to_state().to_string(),
                 encoding="utf-8",
