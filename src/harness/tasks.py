@@ -108,6 +108,15 @@ class TaskRegistry:
             task.cancel_token.cancel()
             return True
 
+    def cancel_current(self) -> bool:
+        """停掉当前任务。新任务还没有 run_id，所以不能按 key 找。"""
+        with self._lock:
+            task = self._current
+            if task is None or task.finished:
+                return False
+            task.cancel_token.cancel()
+            return True
+
     def clear(self) -> None:
         """仅供测试使用。"""
         with self._lock:

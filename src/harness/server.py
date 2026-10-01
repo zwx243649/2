@@ -23,11 +23,12 @@ from .runs_index import (
     load_run,
 )
 from .tasks import TaskRegistry
+from .sessions import InvalidSessionId, validate_session_id
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 DEFAULT_PORT = 8765
 
-ACTION_PATTERN = re.compile(r"^/api/runs/([^/]+)/(approve|reject|cancel)$")
+ACTION_PATTERN = re.compile(r"^/api/runs/([^/]+)/(approve|reject)$")
 ACTION_HEADER = "X-Harness-Action"
 
 def _resume_run(config: HarnessConfig, run_id: str, approve: bool, cancel_token=None):
@@ -56,6 +57,19 @@ def _validate_resumable(config: HarnessConfig, run_id: str) -> None:
     state_path = Path(config.runs_dir) / run_id / STATE_FILENAME
     if not state_path.is_file():
         raise FileNotFoundError(f"{run_id} 没有可继续的状态（找不到 state.json）")
+
+
+def _new_run(config: HarnessConfig, goal: str, session_id: str | None, cancel_token):
+    """网页上发起一次新运行。"""
+    from .runner import Harness
+
+    harness = Harness(config)
+    try:
+        return harness.run_sync(
+            goal, session_id=session_id, cancel_token=cancel_token
+        )
+    finally:
+        harness.close()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -121,24 +135,26 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)  # 读掉 body，避免 keep-alive 连接错位
+        raw = self.rfile.read(length) if length else b""  # 读掉 body，避免连接错位
 
-        match = ACTION_PATTERN.match(urlparse(self.path).path)
+        path = urlparse(self.path).path
+        if path == "/api/runs":
+            self._start_new_run(raw)
+            return
+        if path == "/api/tasks/cancel":
+            if self.tasks.cancel_current():
+                self._json({"ok": True, "cancelling": True})
+            else:
+                self._json({"error": "当前没有在跑的任务"}, 409)
+            return
+
+        match = ACTION_PATTERN.match(path)
         if not match:
             self._json({"error": "not found"}, 404)
             return
 
         run_id = unquote(match.group(1))
         action = match.group(2)
-
-        if action == "cancel":
-            if self.tasks.cancel(run_id):
-                self._json({"ok": True, "cancelling": True})
-            else:
-                self._json({"error": "这个运行当前没有在跑"}, 409)
-            return
-
         approve = action == "approve"
         try:
             _validate_resumable(self.config, run_id)
@@ -158,6 +174,44 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": str(exc)}, 409)
         else:
             # 立刻返回。页面靠轮询 /api/tasks 看进度，也可以随时叫停。
+            self._json({"ok": True, "started": True, "task": task.as_dict()})
+
+    def _start_new_run(self, raw: bytes) -> None:
+        try:
+            payload = json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            self._json({"error": "请求体不是合法 JSON"}, 400)
+            return
+        if not isinstance(payload, dict):
+            self._json({"error": "请求体必须是一个对象"}, 400)
+            return
+
+        goal = str(payload.get("goal") or "").strip()
+        if not goal:
+            self._json({"error": "goal 不能为空"}, 400)
+            return
+
+        session_id = payload.get("session_id") or None
+        if session_id:
+            try:
+                validate_session_id(str(session_id))
+            except InvalidSessionId as exc:
+                self._json({"error": str(exc)}, 400)
+                return
+            session_id = str(session_id)
+
+        # shell 权限跟着服务启动时的配置走，网页不能临时打开它 ——
+        # 那等于让浏览器提权。想跑命令就用 --allow-shell 起服务。
+        config = self.config
+
+        def run(cancel_token):
+            return _new_run(config, goal, session_id, cancel_token)
+
+        try:
+            task = self.tasks.start(key="new", label=f"新任务 {goal[:24]}", fn=run)
+        except RuntimeError as exc:
+            self._json({"error": str(exc)}, 409)
+        else:
             self._json({"ok": True, "started": True, "task": task.as_dict()})
 
     def log_message(self, *args: Any) -> None:

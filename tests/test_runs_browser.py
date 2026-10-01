@@ -422,15 +422,122 @@ def test_tasks_endpoint_is_empty_when_idle(tmp_path):
 
 
 def test_cancel_without_a_running_task_is_conflict(tmp_path):
-    write_run(tmp_path, "20260101-090000")
     httpd, base = _start_server(tmp_path)
     try:
         with pytest.raises(urllib.error.HTTPError) as excinfo:
-            _post(
-                base + "/api/runs/20260101-090000/cancel",
-                {"X-Harness-Action": "1"},
-            )
+            _post(base + "/api/tasks/cancel", {"X-Harness-Action": "1"})
         assert excinfo.value.code == 409
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+# ---- 从网页发起任务 ----
+
+
+def _post_json(url: str, payload: dict):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"X-Harness-Action": "1", "Content-Type": "application/json"},
+    )
+    return urllib.request.urlopen(request, timeout=10)
+
+
+def test_start_a_run_from_the_web(tmp_path, monkeypatch):
+    seen: list = []
+
+    def fake_new_run(config, goal, session_id, cancel_token):
+        seen.append((goal, session_id))
+        return _FakeOutcome()
+
+    monkeypatch.setattr("harness.server._new_run", fake_new_run)
+    httpd, base = _start_server(tmp_path)
+    try:
+        started = json.loads(
+            _post_json(base + "/api/runs", {"goal": "写个 README"}).read()
+        )
+        assert started["started"] is True
+        task = _wait_for_task(base)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert task["outcome_run_id"] == "20260101-090001"
+    assert seen == [("写个 README", None)]
+
+
+def test_start_a_run_with_a_session(tmp_path, monkeypatch):
+    seen: list = []
+
+    def fake_new_run(config, goal, session_id, cancel_token):
+        seen.append(session_id)
+        return _FakeOutcome()
+
+    monkeypatch.setattr("harness.server._new_run", fake_new_run)
+    httpd, base = _start_server(tmp_path)
+    try:
+        _post_json(base + "/api/runs", {"goal": "继续", "session_id": "demo"}).read()
+        _wait_for_task(base)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert seen == ["demo"]
+
+
+def test_empty_goal_is_rejected(tmp_path):
+    httpd, base = _start_server(tmp_path)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post_json(base + "/api/runs", {"goal": "   "})
+        assert excinfo.value.code == 400
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_invalid_session_id_is_rejected(tmp_path):
+    httpd, base = _start_server(tmp_path)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post_json(base + "/api/runs", {"goal": "任务", "session_id": "../坏"})
+        assert excinfo.value.code == 400
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_malformed_body_is_rejected(tmp_path):
+    httpd, base = _start_server(tmp_path)
+    try:
+        request = urllib.request.Request(
+            base + "/api/runs",
+            data="{ 不是 json".encode("utf-8"),
+            method="POST",
+            headers={"X-Harness-Action": "1", "Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(request, timeout=10)
+        assert excinfo.value.code == 400
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_start_run_requires_the_custom_header(tmp_path):
+    httpd, base = _start_server(tmp_path)
+    try:
+        request = urllib.request.Request(
+            base + "/api/runs",
+            data=json.dumps({"goal": "任务"}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(request, timeout=10)
+        assert excinfo.value.code == 403
     finally:
         httpd.shutdown()
         httpd.server_close()

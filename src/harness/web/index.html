@@ -22,6 +22,7 @@
     font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
     color: var(--text);
     background: var(--bg);
+    display: flex; flex-direction: column;
   }
   .num { font-variant-numeric: tabular-nums; font-family: ui-monospace, Consolas, monospace; }
 
@@ -47,8 +48,22 @@
 
   .app {
     display: grid; grid-template-columns: minmax(280px, 360px) 1fr;
-    height: calc(100% - 41px);
+    flex: 1; min-height: 0;
   }
+
+  .newbar {
+    display: flex; gap: 8px; align-items: center;
+    padding: 8px 16px; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .newbar input {
+    font: inherit; font-size: 12.5px; padding: 5px 9px;
+    border: 1px solid var(--border); border-radius: 5px; color: var(--text);
+  }
+  .newbar #goal { flex: 1; min-width: 0; }
+  .newbar #session { width: 150px; }
+  .newbar input:focus { outline: 2px solid #dbe6ff; border-color: var(--accent); }
+  .newbar .hint { color: var(--muted); font-size: 11.5px; }
 
   .list { border-right: 1px solid var(--border); overflow-y: auto; background: var(--panel); }
   .filters {
@@ -171,6 +186,13 @@
   <span class="agg" id="agg">载入中…</span>
   <span id="taskbar"></span>
 </header>
+
+<div class="newbar">
+  <input id="goal" placeholder="要做什么？（回车提交）">
+  <input id="session" placeholder="会话（可选）">
+  <button id="btn-run" class="primary">运行</button>
+  <span class="hint" id="run-msg"></span>
+</div>
 
 <div class="app">
   <div class="list">
@@ -445,13 +467,20 @@ async function runAction(summary, action) {
   }
 }
 
-async function postAction(runId, action) {
-  const res = await fetch(
-    `/api/runs/${encodeURIComponent(runId)}/${action}`,
-    { method: "POST", headers: { "X-Harness-Action": "1" } }
-  );
+async function post(path, body) {
+  const headers = { "X-Harness-Action": "1" };
+  const init = { method: "POST", headers };
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, init);
   const data = await res.json().catch(() => ({}));
   return { ok: res.ok, error: data.error, data };
+}
+
+async function postAction(runId, action) {
+  return post(`/api/runs/${encodeURIComponent(runId)}/${action}`);
 }
 
 let pollTimer = null;
@@ -498,11 +527,39 @@ function renderTaskbar(task) {
   if (stop) {
     stop.onclick = async () => {
       stop.disabled = true;
-      await postAction(task.key, "cancel");
+      await post("/api/tasks/cancel");
       pollTask();
     };
   }
 }
+
+async function startRun() {
+  const goal = $("goal").value.trim();
+  if (!goal) return;
+  const sessionId = $("session").value.trim();
+  const msg = $("run-msg");
+  $("btn-run").disabled = true;
+  msg.textContent = "";
+  try {
+    const result = await post("/api/runs", {
+      goal,
+      session_id: sessionId || null,
+    });
+    if (!result.ok) throw new Error(result.error || "请求失败");
+    $("goal").value = "";
+    msg.textContent = "已开始，进度看右上角";
+    pollTask();
+  } catch (err) {
+    msg.textContent = "失败：" + err.message;
+  } finally {
+    $("btn-run").disabled = false;
+  }
+}
+
+$("btn-run").onclick = startRun;
+$("goal").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") startRun();
+});
 
 loadRuns();
 pollTask();  // 页面刷新后，如果后台还有任务在跑，进度条要接着显示
