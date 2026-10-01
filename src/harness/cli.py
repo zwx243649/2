@@ -45,6 +45,7 @@ def _list_sessions(config: HarnessConfig) -> int:
 
 def _list_pending(config: HarnessConfig) -> int:
     from .runs_index import list_pending
+    from .testresults import describe
 
     items = list_pending(config.runs_dir)
     if not items:
@@ -54,6 +55,9 @@ def _list_pending(config: HarnessConfig) -> int:
     for item in items:
         label = "等批准" if item.status == "paused" else "已停止"
         print(f"{item.run_id}  [{label}]  {item.display_time}  {item.goal[:44]}")
+        if item.test_result:
+            # 放行之前先看到「上次是多少」，才判断得出这次有没有变糟
+            print(f"    上次测试: {describe(item.test_result)}")
         for call in item.pending:
             print(f"    待批准 [{call.get('tool')}] {call.get('arguments')}")
         if item.status == "paused":

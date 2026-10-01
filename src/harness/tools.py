@@ -15,6 +15,7 @@ from pathlib import Path
 from agents import FunctionTool, function_tool
 
 from .config import HarnessConfig
+from .testresults import ResultTracker
 from .workspace import Workspace, WorkspaceError
 
 # 注意：这是防手滑，不是安全沙箱。真要跑不可信代码请用容器。
@@ -137,8 +138,16 @@ def build_write_tools(workspace: Workspace, *, strict: bool = False) -> list[Fun
     return [write_file, edit_file]
 
 
-def build_shell_tools(config: HarnessConfig, workspace: Workspace) -> list[FunctionTool]:
-    """Shell 工具：默认不注册，需要 HARNESS_ALLOW_SHELL=1 显式打开。"""
+def build_shell_tools(
+    config: HarnessConfig,
+    workspace: Workspace,
+    tracker: ResultTracker | None = None,
+) -> list[FunctionTool]:
+    """Shell 工具：默认不注册，需要 HARNESS_ALLOW_SHELL=1 显式打开。
+
+    传了 tracker 的话，命令输出里的测试结果会被认出来，变差时在返回值里
+    直接提示模型 —— 这条提示是模型唯一会读到的「方向反了」的信号。
+    """
 
     @function_tool(
         strict_mode=config.strict_tools,
@@ -171,7 +180,10 @@ def build_shell_tools(config: HarnessConfig, workspace: Workspace) -> list[Funct
             parts.append(f"stdout:\n{stdout.rstrip()}")
         if stderr.strip():
             parts.append(f"stderr:\n{stderr.rstrip()}")
-        return "\n\n".join(parts)
+        body = "\n\n".join(parts)
+        if tracker is not None:
+            body += tracker.observe(command, f"{stdout}\n{stderr}")
+        return body
 
     return [run_command]
 __all__ = [

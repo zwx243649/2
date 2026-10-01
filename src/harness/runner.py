@@ -26,8 +26,9 @@ from .cancel import CancelToken
 from .config import HarnessConfig
 from .progress import Emitter, ProgressHooks
 from .provider import build_model, build_model_settings
-from .runs_index import SUMMARY_FILENAME, build_summary
+from .runs_index import SUMMARY_FILENAME, build_summary, previous_test_result
 from .sessions import open_conversation
+from .testresults import ResultTracker
 from .tools import build_read_tools, build_shell_tools, build_write_tools
 from .tracing import LocalTraceProcessor
 from .usage import TokenUsage, summarize_usage
@@ -108,6 +109,23 @@ def describe_interruptions(interruptions: list[Any]) -> list[dict[str, Any]]:
             }
         )
     return pending
+
+
+def resume_turn_budget(state_payload: dict[str, Any], base: int) -> int:
+    """续跑时该写进 state 的 max_turns。
+
+    SDK 从 RunState 恢复时用的是 **state 里存的** max_turns（run.py 里
+    `max_turns = run_state._max_turns`），传给 Runner 的参数会被忽略。
+    而 current_turn 也是恢复过来的 —— 两者一起沿用，累计到上限之后这个
+    任务就永远续不动了，报 MaxTurnsExceeded，还看不出是这么回事。
+
+    所以每次续跑都给它一份新预算：base + 已经用掉的回合数。
+    """
+    try:
+        used = int(state_payload.get("current_turn", 0) or 0)
+    except (TypeError, ValueError):
+        used = 0
+    return base + max(used, 0)
 
 
 def render_transcript(entries: list[dict[str, Any]]) -> str:
@@ -217,10 +235,17 @@ class Harness:
     注意：追踪开关在 Agents SDK 里是进程级全局状态，同一个进程里只应存在一个 Harness。
     """
 
-    def __init__(self, config: HarnessConfig, model: Any = None) -> None:
+    def __init__(
+        self,
+        config: HarnessConfig,
+        model: Any = None,
+        previous_test_result: dict[str, Any] | None = None,
+    ) -> None:
         self.config = config
         self.processor = LocalTraceProcessor()
         self.progress = ProgressHooks()
+        # 盯着测试结果有没有变差：跨 resume 的记忆靠这个 tracker
+        self.test_results = ResultTracker(previous_test_result)
         self._conversations: dict[str, Any] = {}
         self._configure_tracing()
 
@@ -230,7 +255,9 @@ class Harness:
         read_tools = build_read_tools(self.workspace, strict=config.strict_tools)
         write_tools = build_write_tools(self.workspace, strict=config.strict_tools)
         shell_tools = (
-            build_shell_tools(config, self.workspace) if config.allow_shell else []
+            build_shell_tools(config, self.workspace, self.test_results)
+            if config.allow_shell
+            else []
         )
 
         model_settings = build_model_settings(config)
@@ -353,9 +380,23 @@ class Harness:
         original = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
         self._check_graph_config(original)
 
-        state = await RunState.from_string(
-            self.supervisor, state_path.read_text(encoding="utf-8")
+        # 把上一次的测试结果捞回来，否则这一轮不知道「之前是多少」，
+        # 也就判断不出有没有变差。
+        previous = previous_test_result(self.config.runs_dir, run_id)
+        if previous is not None:
+            result, command = previous
+            self.test_results.previous = result
+            self.test_results.latest = result
+            self.test_results.previous_command = command
+            self.test_results.latest_command = command
+
+        state_text = state_path.read_text(encoding="utf-8")
+        state_payload = json.loads(state_text)
+        state_payload["max_turns"] = resume_turn_budget(
+            state_payload, self.config.max_turns
         )
+        state = await RunState.from_json(self.supervisor, state_payload)
+
         for item in state.get_interruptions():
             if approve:
                 state.approve(item)
@@ -365,7 +406,10 @@ class Harness:
         self.processor.reset()
         started = time.perf_counter()
         result, cancelled = await self._execute(
-            state, session=None, cancel_token=cancel_token, on_event=on_event
+            state,
+            session=None,
+            cancel_token=cancel_token,
+            on_event=on_event,
         )
 
         # 续跑成功后才清掉待处理标记；失败的话状态还在，可以重试
@@ -526,6 +570,8 @@ class Harness:
             "pending": outcome.pending,
             "resumed_from": outcome.resumed_from,
             "graph_config": self._graph_config(),
+            "test_result": self.test_results.latest,
+            "test_command": self.test_results.latest_command,
         }
         (run_dir / "run.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),

@@ -350,6 +350,44 @@ harness --discard <run_id>     # 放弃，只删状态标记（不调用模型�
   ISO-8859-1 发送，中文会先被替换成 `?` 再发出来。用它调这个接口要显式
   传 UTF-8 字节。
 
+## 收敛信号
+
+**起因是一次真实事故**：agent 连续 8 次编辑同一个文件，每改一次跑一次 pytest，
+失败数从 2 一路涨到 13。它每一步都在努力，但**没有任何东西告诉它方向反了**。
+
+人会说「我已经改第三次了，而且更糟」。所以这里做的就是把这句判断变成
+工具返回值的一部分，直接喂回给模型：
+
+```
+exit_code=1
+stdout:
+13 failed, 112 passed in 2.44s
+
+⚠ 失败数从 2 涨到 13（多了 11 个）。这次改动很可能引入了新的失败 ——
+先别继续猜着改，回头看看刚才改了什么，或者停下来报告卡在哪。
+```
+
+变好时也会说一句（`✓ 失败数从 13 降到 0，在收敛`），没变化时不吭声。
+
+两个设计上的要点：
+
+- **跨 resume 的记忆是重点。** 每次 resume 都是一次全新的运行，彼此不知道
+  对方，所以上一次的结果要顺着 `resumed_from` 链捞回来 —— 否则「变差了」
+  根本无从判断。
+- **只在同一条命令之间比较。** 先跑 `pytest tests/test_logfmt.py`（20 passed）
+  再跑 `pytest tests/`（全量），范围完全不同，直接比失败数会误报「变差了」。
+  宁可漏报也不要误报：假警报会让模型去追一个不存在的问题。
+
+`--pending` 里也会显示：
+
+```
+20261001-213443  [等批准]
+    上次测试: 112 passed, 13 failed
+    待批准 [run_command] {"command": "python -m pytest tests/ -q"}
+```
+
+放行之前先看到上次是多少，人才判断得出这次该不该批。
+
 ## 踩过的坑
 
 这几条都是实际调试出来的，不是推测：
@@ -393,6 +431,12 @@ harness --discard <run_id>     # 放弃，只删状态标记（不调用模型�
     `__init__.py` 顶层 `from .runner import Harness`，任何 `import harness`
     都先把 agents SDK 拉起来。改成模块级 `__getattr__` 之后，
     `--help` / `--pending` / `--list-sessions` 从 **约 7 秒降到 0.22 秒**。
+17. **续跑会被 `max_turns` 永久卡死。** SDK 从 `RunState` 恢复时用的是
+    **state 里存的** `max_turns`（`run.py` 里 `max_turns = run_state._max_turns`），
+    传给 `Runner` 的参数会被直接忽略。而 `current_turn` 也是恢复过来的 ——
+    两者一起沿用，累计到上限之后这个任务就再也续不动了，报
+    `MaxTurnsExceeded`，还看不出是这么回事。修法是续跑时先改 state 里的
+    `max_turns` 再反序列化。
 
 ## 成本控制
 

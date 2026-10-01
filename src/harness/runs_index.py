@@ -30,6 +30,8 @@ SUMMARY_KEYS = (
     "model_calls",
     "usage",
     "pending",
+    "test_result",
+    "test_command",
 )
 
 
@@ -70,6 +72,8 @@ class RunSummary:
     #   cancelled —— 有状态但没有待批准项，是被停止的，可以续跑
     status: str = "completed"
     pending: list[dict[str, Any]] = field(default_factory=list)
+    test_result: dict[str, Any] | None = None
+    test_command: str | None = None
 
     @property
     def display_time(self) -> str:
@@ -180,6 +184,8 @@ def summarize_run(
     # pending 也必须跟着状态走：它是落盘时的快照，运行被批准/拒绝解决之后
     # state.json 就没了，再回放那份快照会出现「已完成却还挂着一个待批准」。
     pending = data.get("pending") if resumable else []
+    test_result = data.get("test_result")
+    test_command = data.get("test_command")
     if not resumable:
         status = "completed"
     else:
@@ -193,6 +199,8 @@ def summarize_run(
         session_id=str(session_id) if session_id else None,
         status=status,
         pending=pending if isinstance(pending, list) else [],
+        test_result=test_result if isinstance(test_result, dict) else None,
+        test_command=str(test_command) if test_command else None,
         **usage,
     )
 
@@ -297,6 +305,37 @@ def discard_run(runs_dir: Path, run_id: str) -> None:
     state_path.unlink()
 
 
+def previous_test_result(
+    runs_dir: Path, run_id: str
+) -> tuple[dict[str, Any], str | None] | None:
+    """沿着 resumed_from 往回找最近一次记录到的测试结果。
+
+    每次 resume 都是一次全新的运行，彼此不知道对方 —— 上一次的失败数
+    只能从记录链里捞回来，否则「越改越糟」根本无从判断。
+
+    连当时用的命令一起返回：不同范围的测试（单文件 vs 全量）不能直接比。
+    """
+    runs_dir = Path(runs_dir)
+    seen: set[str] = set()
+    current: str | None = run_id
+
+    while current and current not in seen:
+        seen.add(current)
+        payload = runs_dir / current / "run.json"
+        if not payload.is_file():
+            return None
+        try:
+            data = json.loads(payload.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        result = data.get("test_result")
+        if isinstance(result, dict):
+            command = data.get("test_command")
+            return result, str(command) if command else None
+        current = data.get("resumed_from")
+    return None
+
+
 __all__ = [
     "RUN_ID_PATTERN",
     "STATE_FILENAME",
@@ -311,5 +350,6 @@ __all__ = [
     "list_sessions",
     "load_graph_config",
     "load_run",
+    "previous_test_result",
     "summarize_run",
 ]
