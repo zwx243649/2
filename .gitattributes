@@ -1,0 +1,9 @@
+# 统一用 LF 存储和检出。
+# 不做这一步的话，Windows 上的换行符转换会让整个文件在 diff 里显示成"全部改动"，
+# 那样就没法看清楚真正改了什么。
+* text=auto eol=lf
+
+# 二进制文件不要做换行符转换
+*.png binary
+*.jpg binary
+*.ico binary

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multi-agent-harness"
+version = "0.1.0"
+description = "Supervisor + worker multi-agent harness built on the openai-agents SDK"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai-agents==0.22.3",
+    "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+harness = "harness.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["src"]
