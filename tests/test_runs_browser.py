@@ -17,6 +17,7 @@ from harness.runs_index import (
     SUMMARY_FILENAME,
     RunNotFound,
     build_summary,
+    discard_run,
     list_runs,
     load_run,
 )
@@ -360,7 +361,7 @@ def test_approve_reaches_the_resume_path(tmp_path, monkeypatch):
     _seed_pending(run_dir)
     seen: list = []
 
-    def fake_resume(config, run_id, approve, cancel_token=None):
+    def fake_resume(config, run_id, approve, cancel_token=None, on_event=None):
         seen.append((run_id, approve))
         return _FakeOutcome()
 
@@ -390,7 +391,7 @@ def test_reject_passes_approve_false(tmp_path, monkeypatch):
     _seed_pending(run_dir)
     seen: list = []
 
-    def fake_resume(config, run_id, approve, cancel_token=None):
+    def fake_resume(config, run_id, approve, cancel_token=None, on_event=None):
         seen.append((run_id, approve))
         return _FakeOutcome()
 
@@ -448,7 +449,7 @@ def _post_json(url: str, payload: dict):
 def test_start_a_run_from_the_web(tmp_path, monkeypatch):
     seen: list = []
 
-    def fake_new_run(config, goal, session_id, cancel_token):
+    def fake_new_run(config, goal, session_id, cancel_token, on_event=None):
         seen.append((goal, session_id))
         return _FakeOutcome()
 
@@ -471,7 +472,7 @@ def test_start_a_run_from_the_web(tmp_path, monkeypatch):
 def test_start_a_run_with_a_session(tmp_path, monkeypatch):
     seen: list = []
 
-    def fake_new_run(config, goal, session_id, cancel_token):
+    def fake_new_run(config, goal, session_id, cancel_token, on_event=None):
         seen.append(session_id)
         return _FakeOutcome()
 
@@ -543,11 +544,96 @@ def test_start_run_requires_the_custom_header(tmp_path):
         httpd.server_close()
 
 
+# ---- 放弃一次待处理的工作 ----
+
+
+def test_discard_clears_the_pending_state(tmp_path):
+    """别的出路都要再跑一轮、花一次模型调用；放弃不该花钱。"""
+    run_dir = write_run(tmp_path, "20260101-090000")
+    _seed_pending(run_dir)
+
+    discard_run(tmp_path, "20260101-090000")
+
+    assert not (run_dir / STATE_FILENAME).exists()
+    assert list_runs(tmp_path)[0].status == "completed"
+
+
+def test_discard_without_state_is_rejected(tmp_path):
+    write_run(tmp_path, "20260101-090000")
+
+    with pytest.raises(FileNotFoundError, match="没有待处理的状态"):
+        discard_run(tmp_path, "20260101-090000")
+
+
+@pytest.mark.parametrize("bad_id", ["../../etc", "not-a-run-id", ""])
+def test_discard_rejects_unsafe_ids(tmp_path, bad_id):
+    with pytest.raises(RunNotFound):
+        discard_run(tmp_path, bad_id)
+
+
+def test_discard_endpoint_works(tmp_path):
+    run_dir = write_run(tmp_path, "20260101-090000")
+    _seed_pending(run_dir)
+    httpd, base = _start_server(tmp_path)
+    try:
+        payload = json.loads(
+            _post(
+                base + "/api/runs/20260101-090000/discard",
+                {"X-Harness-Action": "1"},
+            ).read()
+        )
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert payload["discarded"] is True
+    assert not (run_dir / STATE_FILENAME).exists()
+
+
+def test_discard_endpoint_on_non_pending_is_conflict(tmp_path):
+    write_run(tmp_path, "20260101-090000")
+    httpd, base = _start_server(tmp_path)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post(
+                base + "/api/runs/20260101-090000/discard",
+                {"X-Harness-Action": "1"},
+            )
+        assert excinfo.value.code == 409
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_resume_action_is_accepted(tmp_path, monkeypatch):
+    """被停止的运行没有待批准项，resume 就是纯粹接着跑。"""
+    run_dir = write_run(tmp_path, "20260101-090000")
+    _seed_pending(run_dir)
+    seen: list = []
+
+    def fake_resume(config, run_id, approve, cancel_token=None, on_event=None):
+        seen.append(approve)
+        return _FakeOutcome()
+
+    monkeypatch.setattr("harness.server._resume_run", fake_resume)
+    httpd, base = _start_server(tmp_path)
+    try:
+        _post(
+            base + "/api/runs/20260101-090000/resume", {"X-Harness-Action": "1"}
+        ).read()
+        _wait_for_task(base)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert seen == [True]
+
+
 def test_second_action_while_busy_is_conflict(tmp_path, monkeypatch):
     """同一时刻只允许一个任务 —— 追踪状态是进程级全局的。"""
     release = threading.Event()
 
-    def slow_resume(config, run_id, approve, cancel_token=None):
+    def slow_resume(config, run_id, approve, cancel_token=None, on_event=None):
         release.wait(timeout=5)
         return _FakeOutcome()
 

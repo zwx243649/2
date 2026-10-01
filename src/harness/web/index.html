@@ -43,6 +43,11 @@
     width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
     animation: pulse 1.1s ease-in-out infinite;
   }
+  .running .last {
+    max-width: min(46vw, 420px); overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; color: var(--muted);
+    border-left: 1px solid #dbe6ff; padding-left: 8px;
+  }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
   @media (prefers-reduced-motion: reduce) { .dot { animation: none; } }
 
@@ -364,8 +369,9 @@ function renderDetail(data) {
             批准后会立刻继续这次运行（会调用模型，可能执行命令）。
           </div>
           <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
-            <button id="btn-approve" class="primary">批准并继续</button>
-            <button id="btn-reject">拒绝</button>
+            <button data-action="approve" class="primary">批准并继续</button>
+            <button data-action="reject">拒绝</button>
+            <button data-action="discard">放弃</button>
             <span id="action-msg" style="color:var(--muted);font-size:11.5px"></span>
           </div>
         </div>
@@ -373,12 +379,16 @@ function renderDetail(data) {
     : "";
 
   const stoppedBlock = s.status === "cancelled"
-    ? `<div class="baseline-bar" style="background:#f7f8fa;border-color:#d5dbe4">
+      ? `<div class="baseline-bar" style="background:#f7f8fa;border-color:#d5dbe4">
         <div style="flex:1">
           <b style="color:#475569">⏹ 这次运行被停止了</b>
           <div style="margin-top:6px;color:var(--muted);font-size:11.5px">
-            状态已经存下来了，在终端里接着跑：
-            <code>python -m harness --resume ${esc(s.run_id)}</code>
+            状态已经存下来了，可以从断点接着跑。
+          </div>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+            <button data-action="resume" class="primary">继续运行</button>
+            <button data-action="discard">放弃</button>
+            <span id="action-msg" style="color:var(--muted);font-size:11.5px"></span>
           </div>
         </div>
       </div>`
@@ -444,20 +454,23 @@ function renderDetail(data) {
   if (clear) clear.onclick = () => { baselineId = null; renderList(); renderDetail(data); };
   $("set-base").onclick = () => { baselineId = s.run_id; renderList(); renderDetail(data); };
 
-  const approveBtn = $("btn-approve");
-  if (approveBtn) {
-    approveBtn.onclick = () => runAction(s, "approve");
-    $("btn-reject").onclick = () => runAction(s, "reject");
-  }
+  $("detail").querySelectorAll("[data-action]").forEach((btn) => {
+    btn.onclick = () => runAction(s, btn.dataset.action);
+  });
 }
 
 async function runAction(summary, action) {
   const msg = $("action-msg");
-  const buttons = [$("btn-approve"), $("btn-reject")];
+  const buttons = Array.from($("detail").querySelectorAll("[data-action]"));
   buttons.forEach((b) => { b.disabled = true; });
   try {
     const result = await postAction(summary.run_id, action);
     if (!result.ok) throw new Error(result.error || "请求失败");
+    if (action === "discard") {
+      // 放弃不走后台任务，删掉状态标记就完事
+      await loadRuns(false);
+      return;
+    }
     // 服务端立刻返回，任务在后台跑 —— 进度看右上角，那里也能叫停
     msg.textContent = "已交给后台执行，进度看右上角";
     pollTask();
@@ -521,8 +534,11 @@ function renderTaskbar(task) {
   }
 
   const label = task.cancelling ? "正在停止…" : `运行中 ${task.elapsed_s}s`;
+  const last = task.last
+    ? `<span class="last" title="${esc(task.last)}">${esc(task.last)}</span>`
+    : "";
   bar.innerHTML = `<span class="running"><span class="dot"></span>${esc(label)}
-    <button id="btn-cancel"${task.cancelling ? " disabled" : ""}>停止</button></span>`;
+    ${last}<button id="btn-cancel"${task.cancelling ? " disabled" : ""}>停止</button></span>`;
   const stop = $("btn-cancel");
   if (stop) {
     stop.onclick = async () => {

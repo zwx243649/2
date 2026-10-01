@@ -281,6 +281,22 @@ def load_graph_config(runs_dir: Path, run_id: str) -> dict[str, Any]:
     return stored if isinstance(stored, dict) else {}
 
 
+def discard_run(runs_dir: Path, run_id: str) -> None:
+    """放弃一次待处理 / 被停止的运行。
+
+    删掉 state.json 就够了 —— status 是从它推导的，删掉之后这条运行
+    就回到 completed，不再出现在待处理列表里。
+
+    别的出路（批准 / 拒绝 / 继续）都要真的再跑一轮、花一次模型调用；
+    用户决定「这次算了」时不该被迫付这笔钱。
+    """
+    run_dir = _safe_run_dir(Path(runs_dir), run_id)
+    state_path = run_dir / STATE_FILENAME
+    if not state_path.is_file():
+        raise FileNotFoundError(f"{run_id} 没有待处理的状态")
+    state_path.unlink()
+
+
 __all__ = [
     "RUN_ID_PATTERN",
     "STATE_FILENAME",
@@ -289,6 +305,7 @@ __all__ = [
     "RunSummary",
     "SessionInfo",
     "build_summary",
+    "discard_run",
     "list_runs",
     "list_pending",
     "list_sessions",

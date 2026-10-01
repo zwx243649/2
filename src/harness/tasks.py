@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .cancel import CancelToken
@@ -27,6 +28,17 @@ class BackgroundTask:
     finished: bool = False
     outcome: Any = None
     error: str | None = None
+    # 最近几条进度。deque 的 append 在 CPython 里是原子的，
+    # 工作线程写、请求线程读，不用再加锁。
+    recent: deque[str] = field(default_factory=lambda: deque(maxlen=8))
+
+    def note(self, text: str) -> None:
+        """记一条进度。由进度回调在工作线程里调用。"""
+        self.recent.append(str(text)[:120])
+
+    @property
+    def last(self) -> str | None:
+        return self.recent[-1] if self.recent else None
 
     @property
     def elapsed_s(self) -> float:
@@ -54,6 +66,7 @@ class BackgroundTask:
             "error": self.error,
             "outcome_run_id": self.outcome_run_id,
             "outcome_status": self.outcome_status,
+            "last": self.last,
         }
 
 
@@ -74,7 +87,7 @@ class TaskRegistry:
         self,
         key: str,
         label: str,
-        fn: Callable[[CancelToken], Any],
+        fn: Callable[[CancelToken, Callable[[str], None]], Any],
     ) -> BackgroundTask:
         with self._lock:
             if self._current is not None and not self._current.finished:
@@ -89,7 +102,7 @@ class TaskRegistry:
 
         def run() -> None:
             try:
-                task.outcome = fn(task.cancel_token)
+                task.outcome = fn(task.cancel_token, task.note)
             except Exception as exc:  # 后台线程里出错不能把服务带崩
                 task.error = f"{type(exc).__name__}: {exc}"
             finally:

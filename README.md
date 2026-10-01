@@ -48,7 +48,7 @@ src/harness/
   web/          运行浏览器的单页前端
   cli.py        命令行入口
   testing.py    ScriptedModel，离线测试编排用
-tests/          137 个测试，全部离线可跑
+tests/          145 个测试，全部离线可跑
 examples/       offline_demo.py
 ```
 
@@ -225,6 +225,7 @@ worker 拿不到 supervisor 的对话，所以 supervisor 必须把相关背景�
 harness --pending              # 看还有哪些在等
 harness --approve <run_id>     # 放行并继续
 harness --reject  <run_id>     # 拒绝并继续（模型会如实报告验证没做成）
+harness --discard <run_id>     # 放弃，只删状态标记（不调用模型、不花钱）
 ```
 
 **批准之前命令不会执行**，这是有测试兜底的核心断言。
@@ -297,6 +298,10 @@ harness --reject  <run_id>     # 拒绝并继续（模型会如实报告验证�
 网页上也会把被停止的运行标出来（灰色「已停止」，进「待处理」筛选），
 详情里给出 `--resume` 命令。
 
+**「放弃」是唯一不花钱的出路。** 批准 / 拒绝 / 继续都会真的再跑一轮模型；
+如果你决定这次算了，不该被迫付这笔钱。放弃只删掉 `state.json` ——
+`status` 是从它推导的，删掉之后这条运行就回到 `completed`，不再出现在待处理里。
+
 ### 网页上也能停
 
 网页发起的操作现在**立刻返回**，任务在后台跑，右上角有进度和「停止」按钮：
@@ -304,6 +309,16 @@ harness --reject  <run_id>     # 拒绝并继续（模型会如实报告验证�
 ```
 ● 运行中 12s   [停止]
 ```
+
+旁边还会显示**当前正在做什么**（取最后一条进度事件，一秒一刷）：
+
+```
+● 运行中 20s   . write_file -> 已写入 csv_stats.py（5894 字符）   [停止]
+```
+
+实测一次 72 秒的运行，全程能看到 `> supervisor` → `> coder` → `. read_file`
+→ `. write_file` → `< reviewer` → `> coder`（返工）→ `< supervisor`，
+而不是干等一个秒数。
 
 实测同一件事：改之前 `POST /approve` 会**一直挂着直到运行结束**（几十秒），
 改之后 **156ms 返回**，任务状态可轮询、可随时叫停。

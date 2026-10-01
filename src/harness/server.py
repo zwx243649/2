@@ -17,6 +17,7 @@ from .config import HarnessConfig
 from .runs_index import (
     STATE_FILENAME,
     RunNotFound,
+    discard_run,
     list_runs,
     list_sessions,
     load_graph_config,
@@ -28,10 +29,30 @@ from .sessions import InvalidSessionId, validate_session_id
 WEB_DIR = Path(__file__).resolve().parent / "web"
 DEFAULT_PORT = 8765
 
-ACTION_PATTERN = re.compile(r"^/api/runs/([^/]+)/(approve|reject)$")
+ACTION_PATTERN = re.compile(r"^/api/runs/([^/]+)/(approve|reject|resume|discard)$")
 ACTION_HEADER = "X-Harness-Action"
 
-def _resume_run(config: HarnessConfig, run_id: str, approve: bool, cancel_token=None):
+def _progress_note(note):
+    """把进度事件转成一行文字，交给任务记下来。"""
+
+    def emit(event) -> None:
+        try:
+            from .progress import format_event
+
+            note(format_event(event).strip())
+        except Exception:  # 记进度失败绝不能影响运行
+            pass
+
+    return emit
+
+
+def _resume_run(
+    config: HarnessConfig,
+    run_id: str,
+    approve: bool,
+    cancel_token=None,
+    on_event=None,
+):
     """执行一次批准/拒绝。放在函数里是为了延迟导入 agents SDK ——
     只看历史的话根本不需要把它加载起来。"""
     from .runner import Harness
@@ -42,7 +63,10 @@ def _resume_run(config: HarnessConfig, run_id: str, approve: bool, cancel_token=
     harness = Harness(resolved)
     try:
         return harness.resume_sync(
-            run_id, approve=approve, cancel_token=cancel_token
+            run_id,
+            approve=approve,
+            cancel_token=cancel_token,
+            on_event=on_event,
         )
     finally:
         harness.close()
@@ -59,14 +83,23 @@ def _validate_resumable(config: HarnessConfig, run_id: str) -> None:
         raise FileNotFoundError(f"{run_id} 没有可继续的状态（找不到 state.json）")
 
 
-def _new_run(config: HarnessConfig, goal: str, session_id: str | None, cancel_token):
+def _new_run(
+    config: HarnessConfig,
+    goal: str,
+    session_id: str | None,
+    cancel_token,
+    on_event=None,
+):
     """网页上发起一次新运行。"""
     from .runner import Harness
 
     harness = Harness(config)
     try:
         return harness.run_sync(
-            goal, session_id=session_id, cancel_token=cancel_token
+            goal,
+            session_id=session_id,
+            cancel_token=cancel_token,
+            on_event=on_event,
         )
     finally:
         harness.close()
@@ -155,7 +188,21 @@ class _Handler(BaseHTTPRequestHandler):
 
         run_id = unquote(match.group(1))
         action = match.group(2)
-        approve = action == "approve"
+        # resume 和 approve 是同一件事：都是从 state.json 继续。
+        # 区别只在于被停止的运行没有待批准项，那就纯粹接着跑。
+        approve = action in ("approve", "resume")
+
+        if action == "discard":
+            # 不需要模型，也不用起后台任务 —— 只是把状态标记删掉
+            try:
+                discard_run(self.config.runs_dir, run_id)
+            except RunNotFound as exc:
+                self._json({"error": str(exc)}, 404)
+            except FileNotFoundError as exc:
+                self._json({"error": str(exc)}, 409)
+            else:
+                self._json({"ok": True, "discarded": True})
+            return
         try:
             _validate_resumable(self.config, run_id)
         except RunNotFound as exc:
@@ -165,8 +212,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": str(exc)}, 409)
             return
 
-        def run(cancel_token):
-            return _resume_run(self.config, run_id, approve, cancel_token)
+        def run(cancel_token, note):
+            return _resume_run(
+                self.config, run_id, approve, cancel_token, _progress_note(note)
+            )
 
         try:
             task = self.tasks.start(run_id, f"{action} {run_id}", run)
@@ -204,8 +253,10 @@ class _Handler(BaseHTTPRequestHandler):
         # 那等于让浏览器提权。想跑命令就用 --allow-shell 起服务。
         config = self.config
 
-        def run(cancel_token):
-            return _new_run(config, goal, session_id, cancel_token)
+        def run(cancel_token, note):
+            return _new_run(
+                config, goal, session_id, cancel_token, _progress_note(note)
+            )
 
         try:
             task = self.tasks.start(key="new", label=f"新任务 {goal[:24]}", fn=run)

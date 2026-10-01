@@ -61,6 +61,24 @@ def _list_pending(config: HarnessConfig) -> int:
             print(f"    拒绝: python -m harness --reject {item.run_id}")
         else:
             print(f"    继续: python -m harness --resume {item.run_id}")
+        print(f"    放弃: python -m harness --discard {item.run_id}")
+    return 0
+
+
+def _discard(config: HarnessConfig, run_id: str) -> int:
+    """放弃一次待处理的工作。不调用模型，所以不需要凭据。"""
+    from .runs_index import RunNotFound, discard_run
+
+    try:
+        discard_run(config.runs_dir, run_id)
+    except (RunNotFound, FileNotFoundError) as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"删除状态失败: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"已放弃 {run_id}，它不再出现在待处理列表里。")
     return 0
 
 
@@ -256,6 +274,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="继续一次被停止（或已批准）的运行",
     )
     parser.add_argument(
+        "--discard",
+        metavar="RUN_ID",
+        help="放弃一次待处理/被停止的运行（只删状态标记，不调用模型、不花钱）",
+    )
+    parser.add_argument(
         "--quiet",
         "-q",
         action="store_true",
@@ -349,6 +372,10 @@ def main(argv: list[str] | None = None) -> int:
             print(NO_CREDENTIALS_HINT, file=sys.stderr)
             return 2
         return _run_resume(config, args.resume, approve=True, quiet=args.quiet)
+
+    if args.discard:
+        # 不需要模型，所以放在凭据检查之前
+        return _discard(config, args.discard)
 
     if args.session:
         try:
