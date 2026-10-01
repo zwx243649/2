@@ -35,10 +35,17 @@ from .workspace import Workspace
 WORKFLOW_NAME = "multi-agent-harness"
 STATE_FILENAME = "state.json"
 
-# 这几项决定 agent 图长什么样。续跑时如果和原运行不一致，待执行的工具调用
-# 在图中就找不到对应工具 —— 实测踩过：原运行带了 --allow-shell，续跑忘了带，
-# coder 的工具列表里根本没有 run_command，于是永远卡在同一个暂停点。
-GRAPH_CONFIG_KEYS = ("model", "allow_shell", "approve_shell", "strict_tools")
+# 这几项决定一次运行长什么样。续跑时必须一致：
+#   - allow_shell 不一致 → 待执行的工具在新建的图里不存在（实测踩过，会永远卡住）
+#   - max_turns 不一致   → 续跑可能被静默截断，比报错更难排查
+GRAPH_CONFIG_KEYS = (
+    "model",
+    "allow_shell",
+    "approve_shell",
+    "strict_tools",
+    "max_turns",
+    "worker_max_turns",
+)
 
 
 def _clip(value: Any, limit: int = 600) -> str | None:

@@ -172,6 +172,29 @@ def test_status_is_derived_from_the_state_file(tmp_path):
     assert list_runs(runs_dir)[0].status == "completed"
 
 
+def test_pending_clears_once_the_state_file_is_gone(tmp_path):
+    """status 和 pending 必须一致 —— 曾经出现过「已完成却还挂着待批准」。"""
+    runs_dir = tmp_path / "runs"
+    run_dir = runs_dir / "20260101-090000"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "goal": "x",
+                "pending": [{"tool": "run_command", "arguments": "{}"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert list_runs(runs_dir)[0].pending == []  # 没有 state.json 就不该有待办
+
+    (run_dir / STATE_FILENAME).write_text("{}", encoding="utf-8")
+    summary = list_runs(runs_dir)[0]
+    assert summary.status == "paused"
+    assert len(summary.pending) == 1
+
+
 async def test_graph_config_is_persisted_with_the_run(tmp_path):
     harness = Harness(make_config(tmp_path), model=pausing_model())
 
@@ -180,6 +203,8 @@ async def test_graph_config_is_persisted_with_the_run(tmp_path):
     payload = json.loads((outcome.run_dir / "run.json").read_text(encoding="utf-8"))
     assert payload["graph_config"]["allow_shell"] is True
     assert payload["graph_config"]["approve_shell"] is True
+    assert payload["graph_config"]["max_turns"] == 12
+    assert payload["graph_config"]["worker_max_turns"] == 8
 
 
 async def test_resume_rejects_a_mismatched_tool_config(tmp_path):

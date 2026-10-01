@@ -174,7 +174,9 @@ def summarize_run(
 ) -> RunSummary:
     usage = _extract_usage(data)
     session_id = data.get("session_id")
-    pending = data.get("pending")
+    # pending 也必须跟着状态走：它是落盘时的快照，运行被批准/拒绝解决之后
+    # state.json 就没了，再回放那份快照会出现「已完成却还挂着一个待批准」。
+    pending = data.get("pending") if paused else []
     return RunSummary(
         run_id=run_id,
         goal=str(data.get("goal", "")),

@@ -60,6 +60,8 @@
   .row:hover { background: #fafbfc; }
   .row.active { background: #eef4ff; border-left-color: var(--accent); }
   .row.baseline { border-left-color: var(--good); }
+  .row.paused { background: #fffbf0; border-left-color: #d97706; }
+  .row.paused.active { background: #fef3e2; }
   .row .goal {
     font-size: 12.5px; overflow: hidden; text-overflow: ellipsis;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
@@ -68,6 +70,10 @@
   .tag {
     font-size: 10px; padding: 1px 5px; border-radius: 4px;
     background: #e8f5ec; color: var(--good); border: 1px solid #cfe8d8;
+  }
+  .tag.pending {
+    background: #fef3e2; color: #b45309; border-color: #f5d9a8;
+    font-weight: 600;
   }
 
   .detail { overflow-y: auto; padding: 14px 18px 40px; }
@@ -157,7 +163,7 @@ let runs = [];
 let sessions = [];
 let baselineId = null;
 let selectedId = null;
-let filterSession = null;
+let filter = { type: "all", value: null };
 
 const fmt = (n) => n >= 10000 ? (n / 1000).toFixed(1) + "k" : String(n);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) =>
@@ -181,47 +187,71 @@ async function loadRuns() {
   runs = (await runsRes.json()).runs;
   sessions = (await sessRes.json()).sessions;
   const total = runs.reduce((s, r) => s + r.total_tokens, 0);
-  $("agg").textContent = `${runs.length} 次运行 · 合计 ${fmt(total)} tokens`;
+  const waiting = runs.filter((r) => r.status === "paused").length;
+  $("agg").textContent = `${runs.length} 次运行 · 合计 ${fmt(total)} tokens` +
+    (waiting ? ` · ${waiting} 个待批准` : "");
   renderFilters();
   renderList();
   if (runs.length) selectRun(runs[0].run_id);
 }
 
 function renderFilters() {
-  if (!sessions.length) {
-    $("filters").innerHTML = "";
-    return;
+  const pendingCount = runs.filter((r) => r.status === "paused").length;
+  const chips = [`<span class="chip ${filter.type === "all" ? "on" : ""}"
+    data-kind="all" data-value="">全部 <span class="n">${runs.length}</span></span>`];
+
+  if (pendingCount) {
+    chips.push(`<span class="chip ${filter.type === "pending" ? "on" : ""}"
+      data-kind="pending" data-value=""
+      style="border-color:#f5d9a8;color:#b45309">待批准
+      <span class="n">${pendingCount}</span></span>`);
   }
-  const chips = [`<span class="chip ${filterSession ? "" : "on"}" data-s="">全部
-    <span class="n">${runs.length}</span></span>`];
+
   for (const s of sessions) {
-    chips.push(`<span class="chip ${filterSession === s.session_id ? "on" : ""}"
-      data-s="${esc(s.session_id)}" title="${esc(s.title)}">${esc(s.session_id)}
+    const on = filter.type === "session" && filter.value === s.session_id;
+    chips.push(`<span class="chip ${on ? "on" : ""}" data-kind="session"
+      data-value="${esc(s.session_id)}" title="${esc(s.title)}">${esc(s.session_id)}
       <span class="n">${s.run_count}</span></span>`);
   }
+
   $("filters").innerHTML = chips.join("");
   $("filters").querySelectorAll(".chip").forEach((el) => {
     el.onclick = () => {
-      filterSession = el.dataset.s || null;
+      filter = { type: el.dataset.kind, value: el.dataset.value || null };
       renderFilters();
       renderList();
     };
   });
 }
 
+function visibleRuns() {
+  if (filter.type === "pending") return runs.filter((r) => r.status === "paused");
+  if (filter.type === "session") {
+    return runs.filter((r) => r.session_id === filter.value);
+  }
+  return runs;
+}
+
 function renderList() {
-  const visible = filterSession
-    ? runs.filter((r) => r.session_id === filterSession)
-    : runs;
+  const visible = visibleRuns();
+  if (!visible.length) {
+    $("list").innerHTML = '<div class="empty" style="padding:20px">没有匹配的运行</div>';
+    return;
+  }
   $("list").innerHTML = visible.map((r) => {
+    const paused = r.status === "paused";
     const cls = [
       "row",
+      paused ? "paused" : "",
       r.run_id === selectedId ? "active" : "",
       r.run_id === baselineId ? "baseline" : "",
     ].join(" ");
     const tag = r.run_id === baselineId ? '<span class="tag">基线</span>' : "";
-    const sess = r.session_id && !filterSession
+    const sess = r.session_id && filter.type !== "session"
       ? `<span class="tag" style="background:#eef4ff;color:var(--accent);border-color:#dbe6ff">${esc(r.session_id)}</span>`
+      : "";
+    const waiting = paused && r.pending && r.pending.length
+      ? `<span class="tag pending">待批准 ${esc(r.pending[0].tool || "")}</span>`
       : "";
     return `<div class="${cls}" data-id="${esc(r.run_id)}">
       <div class="goal">${esc(r.goal)}</div>
@@ -231,6 +261,7 @@ function renderList() {
         <span class="num">${fmt(r.total_tokens)} tok</span>
         <span class="num">${r.duration_s.toFixed(1)}s</span>
         ${tag}
+        ${waiting}
         ${sess}
       </div>
     </div>`;
@@ -269,6 +300,20 @@ function renderDetail(data) {
          <button id="clear-base">清除基线</button></div>`
     : "";
 
+  const pendingBlock = s.status === "paused" && s.pending && s.pending.length
+    ? `<div class="baseline-bar" style="background:#fffbf0;border-color:#f5d9a8">
+        <div style="flex:1">
+          <b style="color:#b45309">⏸ 等待你批准</b>
+          ${s.pending.map((p) => `<div style="margin-top:4px">
+            <code>${esc(p.tool)} ${esc(p.arguments)}</code></div>`).join("")}
+          <div style="margin-top:6px;color:var(--muted);font-size:11.5px">
+            批准：<code>python -m harness --approve ${esc(s.run_id)}</code>
+            　拒绝：<code>python -m harness --reject ${esc(s.run_id)}</code>
+          </div>
+        </div>
+      </div>`
+    : "";
+
   const steps = data.transcript.map((e, i) => {
     const kind = e.kind === "ToolCallItem" ? '<span class="kind delegate">委派</span>'
       : e.kind === "ToolCallOutputItem" ? '<span class="kind return">回传</span>'
@@ -293,6 +338,7 @@ function renderDetail(data) {
 
   $("detail").innerHTML = `
     ${bar}
+    ${pendingBlock}
     <h2>${esc(s.goal)}</h2>
     <div class="meta" style="color:var(--muted);font-size:12px">
       <span class="num">${esc(s.display_time)}</span> ·
