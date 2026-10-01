@@ -10,8 +10,14 @@ from pathlib import Path
 
 import pytest
 
-from harness.runs_index import SUMMARY_FILENAME, build_summary, list_runs, load_run
-from harness.runs_index import RunNotFound
+from harness.config import HarnessConfig
+from harness.runs_index import (
+    SUMMARY_FILENAME,
+    RunNotFound,
+    build_summary,
+    list_runs,
+    load_run,
+)
 from harness.server import serve
 
 
@@ -162,7 +168,8 @@ def test_load_run_returns_full_payload(tmp_path):
 
 
 def _start_server(runs_dir: Path):
-    httpd = serve(runs_dir, port=0)
+    config = HarnessConfig(runs_dir=runs_dir, workspace=runs_dir / "_ws")
+    httpd = serve(config, port=0)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     host, port = httpd.server_address[:2]
@@ -294,3 +301,114 @@ def test_summary_round_trip_keeps_the_token_numbers(tmp_path):
 
     assert summary.input_tokens == 865
     assert summary.total_tokens == 1287
+
+
+# ---- 写操作（批准 / 拒绝）----
+
+
+class _FakeOutcome:
+    run_id = "20260101-090001"
+    status = "completed"
+    final_output = "完成"
+    pending: list = []
+
+
+def _post(url: str, headers: dict | None = None):
+    request = urllib.request.Request(
+        url, data=b"", method="POST", headers=headers or {}
+    )
+    return urllib.request.urlopen(request, timeout=10)
+
+
+def test_action_requires_the_custom_header(tmp_path):
+    """本地服务唯一的写操作必须有 CSRF 防护。
+
+    跨域请求带自定义头会先发预检，而服务不响应预检 —— 浏览器会把
+    恶意页面发起的请求挡住。
+    """
+    write_run(tmp_path, "20260101-090000")
+    httpd, base = _start_server(tmp_path)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post(base + "/api/runs/20260101-090000/approve")
+        assert excinfo.value.code == 403
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_approve_reaches_the_resume_path(tmp_path, monkeypatch):
+    write_run(tmp_path, "20260101-090000")
+    seen: list = []
+
+    def fake_resume(config, run_id, approve):
+        seen.append((run_id, approve))
+        return _FakeOutcome()
+
+    monkeypatch.setattr("harness.server._resume_run", fake_resume)
+    httpd, base = _start_server(tmp_path)
+    try:
+        payload = json.loads(
+            _post(
+                base + "/api/runs/20260101-090000/approve",
+                {"X-Harness-Action": "1"},
+            ).read()
+        )
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert payload["ok"] is True
+    assert payload["run_id"] == "20260101-090001"
+    assert seen == [("20260101-090000", True)]
+
+
+def test_reject_passes_approve_false(tmp_path, monkeypatch):
+    write_run(tmp_path, "20260101-090000")
+    seen: list = []
+
+    def fake_resume(config, run_id, approve):
+        seen.append((run_id, approve))
+        return _FakeOutcome()
+
+    monkeypatch.setattr("harness.server._resume_run", fake_resume)
+    httpd, base = _start_server(tmp_path)
+    try:
+        _post(
+            base + "/api/runs/20260101-090000/reject", {"X-Harness-Action": "1"}
+        ).read()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert seen == [("20260101-090000", False)]
+
+
+def test_action_on_a_non_pending_run_returns_conflict(tmp_path):
+    """已经处理过的运行不该被当成成功。"""
+    write_run(tmp_path, "20260101-090000")  # 没有 state.json
+    httpd, base = _start_server(tmp_path)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post(
+                base + "/api/runs/20260101-090000/approve",
+                {"X-Harness-Action": "1"},
+            )
+        assert excinfo.value.code == 409
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_action_with_unsafe_run_id_is_404(tmp_path):
+    httpd, base = _start_server(tmp_path)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post(
+                base + "/api/runs/..%2F..%2Fetc/approve",
+                {"X-Harness-Action": "1"},
+            )
+        assert excinfo.value.code == 404
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

@@ -109,6 +109,11 @@
     border-radius: 5px; cursor: pointer; color: var(--text);
   }
   button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary {
+    background: var(--accent); border-color: var(--accent); color: #fff;
+  }
+  button.primary:hover { background: #1d4ed8; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
 
   pre.out {
     background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
@@ -179,7 +184,7 @@ function delta(now, base, lowerIsBetter = true) {
   return `<span class="delta ${cls}">${sign}${pct.toFixed(0)}%</span>`;
 }
 
-async function loadRuns() {
+async function loadRuns(autoSelect = true) {
   const [runsRes, sessRes] = await Promise.all([
     fetch("/api/runs"),
     fetch("/api/sessions"),
@@ -192,7 +197,7 @@ async function loadRuns() {
     (waiting ? ` · ${waiting} 个待批准` : "");
   renderFilters();
   renderList();
-  if (runs.length) selectRun(runs[0].run_id);
+  if (autoSelect && runs.length) selectRun(runs[0].run_id);
 }
 
 function renderFilters() {
@@ -307,8 +312,12 @@ function renderDetail(data) {
           ${s.pending.map((p) => `<div style="margin-top:4px">
             <code>${esc(p.tool)} ${esc(p.arguments)}</code></div>`).join("")}
           <div style="margin-top:6px;color:var(--muted);font-size:11.5px">
-            批准：<code>python -m harness --approve ${esc(s.run_id)}</code>
-            　拒绝：<code>python -m harness --reject ${esc(s.run_id)}</code>
+            批准后会立刻继续这次运行（会调用模型，可能执行命令）。
+          </div>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+            <button id="btn-approve" class="primary">批准并继续</button>
+            <button id="btn-reject">拒绝</button>
+            <span id="action-msg" style="color:var(--muted);font-size:11.5px"></span>
           </div>
         </div>
       </div>`
@@ -372,6 +381,35 @@ function renderDetail(data) {
   const clear = $("clear-base");
   if (clear) clear.onclick = () => { baselineId = null; renderList(); renderDetail(data); };
   $("set-base").onclick = () => { baselineId = s.run_id; renderList(); renderDetail(data); };
+
+  const approveBtn = $("btn-approve");
+  if (approveBtn) {
+    approveBtn.onclick = () => runAction(s, "approve");
+    $("btn-reject").onclick = () => runAction(s, "reject");
+  }
+}
+
+async function runAction(summary, action) {
+  const msg = $("action-msg");
+  const buttons = [$("btn-approve"), $("btn-reject")];
+  buttons.forEach((b) => { b.disabled = true; });
+  msg.textContent = action === "approve"
+    ? "已批准，正在继续运行…（可能要几十秒）"
+    : "已拒绝，正在继续运行…";
+  try {
+    const res = await fetch(
+      `/api/runs/${encodeURIComponent(summary.run_id)}/${action}`,
+      { method: "POST", headers: { "X-Harness-Action": "1" } }
+    );
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    msg.textContent = "完成，正在刷新…";
+    await loadRuns(false);
+    selectRun(data.run_id);
+  } catch (err) {
+    msg.textContent = "失败：" + err.message;
+    buttons.forEach((b) => { b.disabled = false; });
+  }
 }
 
 loadRuns();

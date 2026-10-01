@@ -103,7 +103,7 @@ def _has_credentials(config: HarnessConfig) -> bool:
 
 def _serve(config: HarnessConfig, port: int) -> int:
     try:
-        httpd = serve_runs(config.runs_dir, port=port)
+        httpd = serve_runs(config, port=port)
     except OSError as exc:
         print(f"启动失败（端口被占用？）: {exc}", file=sys.stderr)
         return 1
