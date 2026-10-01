@@ -36,7 +36,7 @@ src/harness/
   config.py     环境变量 → HarnessConfig
   provider.py   模型/端点构造（OpenAI 官方 或 任意 OpenAI 兼容端点）
   workspace.py  路径沙箱：所有文件访问都限制在 workspace 内
-  tools.py      工具层（list_files / read_file / write_file / run_command）
+  tools.py      工具层（list_files / read_file / write_file / edit_file / run_command）
   agents.py     supervisor 与三个 worker 的定义、提示词
   progress.py   运行时的实时进度事件（RunHooks）
   tracing.py    本地 span 收集器（数据不出本机）

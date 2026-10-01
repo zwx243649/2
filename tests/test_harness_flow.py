@@ -88,7 +88,12 @@ async def test_worker_writes_a_real_file_through_the_tool(tmp_path):
     # supervisor 只能看到 worker 的最终结论，看不到 worker 内部的 write_file 调用
     supervisor_tools = [call["tools"] for call in model.calls]
     assert supervisor_tools[0] == ["coder", "researcher", "reviewer"]
-    assert supervisor_tools[1] == ["list_files", "read_file", "write_file"]
+    assert supervisor_tools[1] == [
+        "edit_file",
+        "list_files",
+        "read_file",
+        "write_file",
+    ]
 
     span_names = [span.get("name") for span in outcome.spans]
     assert "coder" in span_names
@@ -152,3 +157,31 @@ async def test_empty_goal_is_rejected(tmp_path):
         assert "不能为空" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("空 goal 应该报错")
+
+
+async def test_worker_edits_a_file_without_shell_or_approval(tmp_path):
+    """edit_file 是沙箱内的文件操作，不该触发审批、也不该需要 shell。"""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "a.py").write_text("import old\n", encoding="utf-8")
+
+    model = ScriptedModel(
+        [
+            tool_call_response("coder", {"input": "改 import"}, call_id="c1"),
+            tool_call_response(
+                "edit_file",
+                {"path": "a.py", "old": "import old", "new": "import new"},
+                call_id="c2",
+            ),
+            text_response("已改", response_id="r1"),
+            text_response("完成", response_id="r2"),
+        ]
+    )
+    # 故意开 shell：edit_file 仍不该被审批门拦下
+    harness = Harness(make_config(tmp_path, allow_shell=True), model=model)
+
+    outcome = await harness.run("把 import old 改成 import new")
+
+    assert outcome.status == "completed"
+    assert outcome.pending == []
+    assert (workspace / "a.py").read_text(encoding="utf-8") == "import new\n"

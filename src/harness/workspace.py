@@ -85,3 +85,34 @@ class Workspace:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8", newline="\n")
         return self.rel(target)
+
+    def replace_text(self, path: str, old: str, new: str) -> tuple[str, int]:
+        """精确替换文件里的一段文本，返回 (相对路径, 替换次数)。
+
+        要求 old 在文件里**唯一出现**。出现了多次就报错而不是猜 —— 猜错
+        一次会静默改坏另一处，比报错难查得多。想改多处就带上更多上下文，
+        让每一处都能被唯一定位。
+        """
+        if not old:
+            raise WorkspaceError("old 不能为空")
+
+        target = self.resolve(path, must_exist=True)
+        if target.is_dir():
+            raise WorkspaceError(f"{path} 是目录，不是文件。")
+
+        body = target.read_text(encoding="utf-8")
+        occurrences = body.count(old)
+        if occurrences == 0:
+            raise WorkspaceError(
+                f"在 {path} 里找不到要替换的内容。"
+                "注意 old 必须逐字符匹配（包括缩进和空行）；"
+                "先用 read_file 确认原文。"
+            )
+        if occurrences > 1:
+            raise WorkspaceError(
+                f"要替换的内容在 {path} 里出现了 {occurrences} 次，无法确定改哪一处。"
+                "请多带几行上下文，让匹配唯一。"
+            )
+
+        target.write_text(body.replace(old, new, 1), encoding="utf-8", newline="\n")
+        return self.rel(target), 1

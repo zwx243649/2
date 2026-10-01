@@ -117,7 +117,24 @@ def build_write_tools(workspace: Workspace, *, strict: bool = False) -> list[Fun
         written = workspace.write_text(path, content)
         return f"已写入 {written}（{len(content)} 字符）"
 
-    return [write_file]
+    @function_tool(strict_mode=strict)
+    def edit_file(path: str, old: str, new: str) -> str:
+        """修改工作区内已有文件的一小段内容（精确替换）。
+
+        改已有文件优先用这个：
+        - 比 write_file 省 token —— 只给要改的那几行，不用重写整个文件
+        - 比用 run_command 跑脚本改文件安全，也不会绕过审批
+
+        Args:
+            path: 相对工作区根目录的路径。
+            old: 要被替换掉的原文，必须和文件里逐字符一致（含缩进），
+                 且在整个文件里只出现一次；出现了多次要带上更多上下文。
+            new: 替换成的新内容。
+        """
+        written, count = workspace.replace_text(path, old, new)
+        return f"已替换 {written} 里的 {count} 处内容"
+
+    return [write_file, edit_file]
 
 
 def build_shell_tools(config: HarnessConfig, workspace: Workspace) -> list[FunctionTool]:
