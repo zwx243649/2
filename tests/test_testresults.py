@@ -10,6 +10,7 @@ import pytest
 from harness import Harness, HarnessConfig
 from harness.runs_index import previous_test_result
 from harness.runner import resume_turn_budget
+from harness.testing import ScriptedModel, text_response, tool_call_response
 from harness.testresults import (
     ResultTracker,
     failure_count,
@@ -116,6 +117,58 @@ def test_tracker_compares_only_the_same_command():
     assert "涨到 13" in notice
 
 
+# ---- 连续变差就主动叫停 ----
+
+
+def test_tracker_warns_first_then_stops_on_the_second_regression():
+    stopped: list[bool] = []
+    tracker = ResultTracker(
+        {"passed": 120, "failed": 5, "errors": 0},
+        previous_command="pytest -q",
+        on_stop=lambda: stopped.append(True),
+        regression_limit=2,
+    )
+
+    first = tracker.observe("pytest -q", "8 failed, 117 passed in 1s")
+    assert "⚠" in first
+    assert stopped == [], "第一次变差只该警告"
+
+    second = tracker.observe("pytest -q", "13 failed, 112 passed in 1s")
+    assert "⛔" in second
+    assert stopped == [True], "第二次连续变差该叫停"
+    assert tracker.stop_reason and "连续 2 次" in tracker.stop_reason
+
+
+def test_an_improvement_resets_the_regression_counter():
+    tracker = ResultTracker(
+        {"passed": 120, "failed": 5, "errors": 0},
+        previous_command="pytest -q",
+        regression_limit=2,
+    )
+
+    tracker.observe("pytest -q", "8 failed, 117 passed in 1s")  # 退步 1
+    tracker.observe("pytest -q", "3 failed, 122 passed in 1s")  # 好转 -> 归零
+    notice = tracker.observe("pytest -q", "9 failed, 116 passed in 1s")  # 退步 1
+
+    assert "⚠" in notice
+    assert tracker.consecutive_regressions == 1
+    assert tracker.stop_reason is None
+
+
+def test_a_different_command_does_not_count_as_a_regression():
+    """换个测试范围不算退步 —— 那只是换了个基准。"""
+    tracker = ResultTracker(
+        {"passed": 20, "failed": 0, "errors": 0},
+        previous_command="pytest tests/test_a.py -q",
+        regression_limit=2,
+    )
+
+    notice = tracker.observe("pytest tests/ -q", "13 failed, 112 passed in 3s")
+
+    assert notice == ""
+    assert tracker.consecutive_regressions == 0
+
+
 # ---- 跨 resume 的记忆 ----
 
 
@@ -199,6 +252,57 @@ def test_harness_can_be_seeded_with_a_previous_result(tmp_path):
         assert harness.test_results.previous == {"failed": 2, "passed": 123}
     finally:
         harness.close()
+
+
+async def test_run_is_cancelled_after_consecutive_regressions(tmp_path):
+    """核心断言：不是提示模型，是 harness 自己叫停。"""
+
+    # 现实里命令是同一条（pytest -q），变的只是输出。所以这里用一个会记住
+    # 调用次数的小脚本：同一条命令，每次都报出更差的测试结果。
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True)
+    (workspace / "counter.py").write_text(
+        "import pathlib\n"
+        "p = pathlib.Path('n.txt')\n"
+        "n = int(p.read_text()) if p.exists() else 0\n"
+        "p.write_text(str(n + 1))\n"
+        "rows = ['5 failed, 120 passed', '5 failed, 120 passed',\n"
+        "        '8 failed, 117 passed', '13 failed, 112 passed']\n"
+        "print(rows[min(n, len(rows) - 1)], 'in 1s')\n",
+        encoding="utf-8",
+    )
+
+    def run_counter(call_id: str):
+        return tool_call_response(
+            "run_command", {"command": "python counter.py"}, call_id=call_id
+        )
+
+    model = ScriptedModel(
+        [
+            tool_call_response("coder", {"input": "跑测试"}, call_id="c0"),
+            run_counter("c1"),  # 基准
+            run_counter("c2"),  # 没变
+            run_counter("c3"),  # 退步 1 -> 警告
+            run_counter("c4"),  # 退步 2 -> 叫停
+            text_response("不该跑到这里", "r1"),
+        ]
+    )
+    config = HarnessConfig(
+        workspace=tmp_path / "ws",
+        runs_dir=tmp_path / "runs",
+        allow_shell=True,
+        # 关掉逐条审批，否则命令还没执行运行就先暂停了，tracker 拿不到输出
+        approve_shell=False,
+    )
+    harness = Harness(config, model=model)
+    try:
+        outcome = await harness.run("修测试")
+    finally:
+        harness.close()
+
+    assert outcome.status == "cancelled"
+    assert outcome.stop_reason is not None
+    assert "连续" in outcome.stop_reason
 
 
 # ---- 续跑的回合预算 ----

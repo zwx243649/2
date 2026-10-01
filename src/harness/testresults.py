@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Callable
 
 # pytest 的汇总行长这样：
 #   13 failed, 112 passed in 2.44s
@@ -25,6 +25,10 @@ SUMMARY_LINE = re.compile(
 COUNT = re.compile(r"(\d+)\s+(passed|failed|errors?)")
 
 FAILURE_KEYS = ("failed", "errors")
+
+# 连续这么多次「失败数上升」就主动停下。设成 2 是因为：
+# 一次变差可能只是暴露了之前没跑到的新失败，两次连续变差基本可以确定方向错了。
+DEFAULT_REGRESSION_LIMIT = 2
 
 
 def parse_test_summary(text: str) -> dict[str, int] | None:
@@ -73,11 +77,17 @@ class ResultTracker:
         self,
         previous: dict[str, Any] | None = None,
         previous_command: str | None = None,
+        on_stop: Callable[[], None] | None = None,
+        regression_limit: int = DEFAULT_REGRESSION_LIMIT,
     ) -> None:
         self.previous: dict[str, int] | None = previous
         self.previous_command: str | None = previous_command
         self.latest: dict[str, int] | None = previous
         self.latest_command: str | None = previous_command
+        self.on_stop = on_stop
+        self.regression_limit = max(1, regression_limit)
+        self.consecutive_regressions = 0
+        self.stop_reason: str | None = None
 
     def observe(self, command: str, output: str) -> str:
         """看一段命令输出。返回要追加给模型的提示（没有变化就返回空串）。"""
@@ -93,23 +103,43 @@ class ResultTracker:
         if before is None or not same_command:
             self.previous = result
             self.previous_command = command
+            self.consecutive_regressions = 0
             return ""
         self.previous = result
 
         now = failure_count(result)
         was = failure_count(before)
-        if now > was:
-            return (
-                f"\n\n⚠ 失败数从 {was} 涨到 {now}（多了 {now - was} 个）。"
-                "这次改动很可能引入了新的失败 —— 先别继续猜着改，"
-                "回头看看刚才改了什么，或者停下来报告卡在哪。"
-            )
+
         if now < was:
+            self.consecutive_regressions = 0
             return f"\n\n✓ 失败数从 {was} 降到 {now}，在收敛。"
-        return ""
+        if now == was:
+            # 没变好也没变坏 —— 不算退步，但也不重置计数
+            return ""
+
+        self.consecutive_regressions += 1
+        if self.consecutive_regressions >= self.regression_limit:
+            self.stop_reason = (
+                f"测试失败数连续 {self.consecutive_regressions} 次上升"
+                f"（最近一次 {was} → {now}）"
+            )
+            if self.on_stop is not None:
+                self.on_stop()
+            return (
+                f"\n\n⛔ 失败数连续 {self.consecutive_regressions} 次上升"
+                f"（{was} → {now}）。harness 已主动停止这次运行 —— "
+                "继续猜下去只会更糟。请人工看看到底改坏了什么。"
+            )
+
+        return (
+            f"\n\n⚠ 失败数从 {was} 涨到 {now}（多了 {now - was} 个）。"
+            "这次改动很可能引入了新的失败 —— 先别继续猜着改，"
+            "回头看看刚才改了什么，或者停下来报告卡在哪。"
+        )
 
 
 __all__ = [
+    "DEFAULT_REGRESSION_LIMIT",
     "ResultTracker",
     "describe",
     "failure_count",

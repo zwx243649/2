@@ -159,9 +159,10 @@ class RunOutcome:
     run_dir: Path | None = None
     run_id: str | None = None
     session_id: str | None = None
-    status: str = "completed"  # completed | paused
+    status: str = "completed"  # completed | paused | cancelled
     pending: list[dict[str, Any]] = field(default_factory=list)
     resumed_from: str | None = None
+    stop_reason: str | None = None
 
     @property
     def model_calls(self) -> int:
@@ -178,7 +179,7 @@ class RunOutcome:
                     "=" * 60,
                     f"目标\n{self.goal}",
                     "-" * 60,
-                    "⏹ 已停止（这次没有跑完）",
+                    f"⏹ 已停止（{self.stop_reason or '用户手动停止'}）",
                     "",
                     "状态已经存下来了，可以接着跑：",
                     f"  python -m harness --resume {self.run_id or '(见运行目录)'}",
@@ -245,7 +246,11 @@ class Harness:
         self.processor = LocalTraceProcessor()
         self.progress = ProgressHooks()
         # 盯着测试结果有没有变差：跨 resume 的记忆靠这个 tracker
-        self.test_results = ResultTracker(previous_test_result)
+        # 连续变差时由 tracker 回调 _request_stop 主动叫停
+        self._active_cancel: CancelToken | None = None
+        self.test_results = ResultTracker(
+            previous_test_result, on_stop=self._request_stop
+        )
         self._conversations: dict[str, Any] = {}
         self._configure_tracing()
 
@@ -439,6 +444,9 @@ class Harness:
         中断入口。取消是协作式的 —— 轮询到信号后调 cancel()，运行会自己收尾，
         状态留在 result 里，之后可以续跑。
         """
+        # 没传 token 也造一个：harness 自己（比如收敛检测）要靠它叫停
+        token = cancel_token if cancel_token is not None else CancelToken()
+        self._active_cancel = token
         self.progress.set_emitter(on_event)
         try:
             result = Runner.run_streamed(
@@ -456,12 +464,19 @@ class Harness:
             )
             cancelled = False
             async for _event in result.stream_events():
-                if not cancelled and cancel_token is not None and cancel_token.cancelled:
+                if not cancelled and token.cancelled:
                     cancelled = True
                     result.cancel()
             return result, cancelled
         finally:
+            self._active_cancel = None
             self.progress.set_emitter(None)
+
+    def _request_stop(self) -> None:
+        """收敛检测判定「再改下去只会更糟」时走这里主动叫停。"""
+        token = self._active_cancel
+        if token is not None:
+            token.cancel()
 
     def _build_outcome(
         self,
@@ -493,6 +508,7 @@ class Harness:
             status=status,
             pending=describe_interruptions(interruptions),
             resumed_from=resumed_from,
+            stop_reason=self.test_results.stop_reason if cancelled else None,
         )
 
     def _finish(self, outcome: RunOutcome, result: RunResult) -> RunOutcome:
