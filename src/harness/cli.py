@@ -8,6 +8,47 @@ import sys
 from .config import TRACING_MODES, HarnessConfig
 from .progress import ConsoleReporter
 from .runner import Harness
+from .server import DEFAULT_PORT
+from .server import serve as serve_runs
+from .sessions import InvalidSessionId, validate_session_id
+
+
+def _list_sessions(config: HarnessConfig) -> int:
+    from .runs_index import list_sessions
+
+    sessions = list_sessions(config.runs_dir)
+    if not sessions:
+        print("还没有会话。用 --session <名字> 跑一次任务就会创建。")
+        return 0
+
+    print(f"{'会话':<22} {'运行':>4} {'tokens':>9}  {'最近一次':<16} 标题")
+    for item in sessions:
+        title = item.title if len(item.title) <= 36 else item.title[:36] + "…"
+        print(
+            f"{item.session_id:<22} {item.run_count:>4} {item.total_tokens:>9}  "
+            f"{item.last_run:<16} {title}"
+        )
+    return 0
+
+
+def _serve(config: HarnessConfig, port: int) -> int:
+    try:
+        httpd = serve_runs(config.runs_dir, port=port)
+    except OSError as exc:
+        print(f"启动失败（端口被占用？）: {exc}", file=sys.stderr)
+        return 1
+
+    host, bound_port = httpd.server_address[:2]
+    print(f"运行浏览器：http://{host}:{bound_port}")
+    print(f"数据目录　：{config.runs_dir}")
+    print("按 Ctrl+C 停止。")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止。")
+    finally:
+        httpd.server_close()
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +90,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="只打印解析后的配置和工具装配，不调用模型",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="打印内部 span 时间线")
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="启动运行浏览器（只读查看 runs/ 里的历史），不执行任务",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"运行浏览器的端口（默认 {DEFAULT_PORT}）",
+    )
+    parser.add_argument(
+        "--session",
+        help="在指定会话里运行，复用该会话之前的历史（多轮追问）",
+    )
+    parser.add_argument(
+        "--list-sessions",
+        dest="list_sessions",
+        action="store_true",
+        help="列出所有会话后退出",
+    )
     parser.add_argument(
         "--quiet",
         "-q",
@@ -120,6 +182,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 2
 
+    if args.serve:
+        return _serve(config, args.port)
+
+    if args.list_sessions:
+        return _list_sessions(config)
+
+    if args.session:
+        try:
+            validate_session_id(args.session)
+        except InvalidSessionId as exc:
+            print(f"会话名不合法: {exc}", file=sys.stderr)
+            return 2
+
     try:
         harness = Harness(config)
     except Exception as exc:
@@ -148,13 +223,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # 进度走 stderr，最终报告走 stdout，方便 `> result.txt` 重定向
         reporter = None if args.quiet else ConsoleReporter()
-        outcome = harness.run_sync(goal, on_event=reporter)
+        outcome = harness.run_sync(
+            goal, session_id=args.session, on_event=reporter
+        )
     except KeyboardInterrupt:
         print("\n已中断。", file=sys.stderr)
         return 130
     except Exception as exc:
         print(f"运行失败: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+    finally:
+        harness.close()
 
     print(outcome.render(verbose=args.verbose))
     return 0

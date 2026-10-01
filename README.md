@@ -41,9 +41,14 @@ src/harness/
   progress.py   运行时的实时进度事件（RunHooks）
   tracing.py    本地 span 收集器（数据不出本机）
   runner.py     组装 + 运行 + 落盘产物
+  runs_index.py runs/ 的数据层（纯数据，可单测）
+  usage.py      token 消耗统计（写入方和读取方共用，避免循环依赖）
+  sessions.py   会话：对话历史持久化 + 会话名校验
+  server.py     本地只读服务（标准库，无 Web 框架）
+  web/          运行浏览器的单页前端
   cli.py        命令行入口
   testing.py    ScriptedModel，离线测试编排用
-tests/          10 个测试，全部离线可跑
+tests/          98 个测试，全部离线可跑
 examples/       offline_demo.py
 ```
 
@@ -64,6 +69,14 @@ Copy-Item .env.example .env    # 然后填 HARNESS_API_KEY
 
 常用参数：`--workspace` `--model` `--base-url` `--max-turns` `--allow-shell` `--tracing` `-v`。
 加 `--quiet` 可以关掉实时进度，只在结束时打印报告。
+
+多轮追问用 `--session`，看历史用 `--list-sessions`：
+
+```powershell
+.\.venv\Scripts\python.exe -m harness --session refactor "把 utils.py 里的重复逻辑合并"
+.\.venv\Scripts\python.exe -m harness --session refactor "刚才改的那两个函数，补一下测试"
+.\.venv\Scripts\python.exe -m harness --list-sessions
+```
 
 ### 不用 API key 先看效果
 
@@ -130,6 +143,62 @@ HARNESS_MODEL=qwen3:8b
 
 进度写 stderr、报告写 stdout，所以 `harness "任务" > result.txt` 只会重定向报告。
 
+## 运行浏览器
+
+```powershell
+.\.venv\Scripts\python.exe -m harness --serve        # 默认 http://127.0.0.1:8765
+.\.venv\Scripts\python.exe -m harness --serve --port 9000
+```
+
+左边是历史运行列表（时间 / 调用次数 / tokens / 耗时），点开看详情：
+结论、`委派轨迹`、`内部 span`，以及完整的消耗拆分。
+
+**调提示词时最有用的是「设为对比基线」**：把某一次钉成基线，再点别的运行，
+每个指标后面会直接显示涨跌百分比。比如把优化前的 hello.py 那次设为基线，
+就能看到优化后调用次数 `-80%`、tokens `-94%`。
+
+设计上的取舍：
+
+- **只用标准库**，没引 Web 框架。这是个本地查看器，不值得为它加依赖。
+- **默认绑定 `127.0.0.1`**。`runs/` 里含完整的 prompt 和产出，不该暴露到网络上。
+- **数据层（`runs_index.py`）和 HTTP 层分开**，所以读取逻辑可以单独测试；
+  同时对 `run_id` 做了格式校验 + 路径穿越防护，坏记录的目录会被跳过而不是拖垮整个列表。
+- 这个页面以后会长成实时控制台，所以从一开始就做成了服务而不是生成静态 HTML。
+- **列表读的是小文件。** 完整 `run.json` 里 spans 占了九成以上（单份 164 KB），
+  而列表只需要几百字节的标量字段。所以落盘时会顺手写一份 `summary.json`（181 字节），
+  列表接口优先读它，读不到才退回解析完整记录。
+  实测 500 次运行：**1907ms → 164ms**。
+
+顶部会把带会话的运行按会话分组，点一下只看该会话的几次运行。
+
+## 会话
+
+带 `--session <名字>` 的运行会共享同一段对话历史，**跨进程存活**：
+
+```powershell
+> harness --session memory-test "记住口令：蓝鲸。不要写文件，直接确认。"
+确认，口令已记住：蓝鲸。
+
+> harness --session memory-test "我刚才让你记的口令是什么？"
+蓝鲸。
+```
+
+两次是独立的进程调用，第二句能答对，说明历史真的落盘了。
+
+实现上刻意做得很薄：
+
+- **对话历史**（模型真正看到的东西）交给 SDK 自带的 `SQLiteSession`，
+  存储落在 `runs/sessions.db`。这种地方不该自己造轮子。
+- **会话的展示信息不额外存**：`run.json` 里记一个 `session_id`，
+  标题、运行次数、累计 tokens 全部从 `runs/` 分组推出来。
+  只有一个真实数据源，不存在"索引和实际数据对不上"的问题。
+- 会话名会被用作数据库键，也会出现在网页 URL 里，所以限制成
+  `字母/数字/._-`、最长 64 字符，避免注入和路径问题。
+
+一个需要注意的边界：**会话历史属于 supervisor，worker 仍然是无状态的。**
+worker 拿不到 supervisor 的对话，所以 supervisor 必须把相关背景写进委派内容里
+——这正是它提示词里「委派必须自包含」那条规则。
+
 ## 踩过的坑
 
 这几条都是实际调试出来的，不是推测：
@@ -151,6 +220,9 @@ HARNESS_MODEL=qwen3:8b
 9. **`run_command` 里裸 `python` 会走 PATH 解析到系统解释器。** 实测时 agent 以为
    在验证代码，其实跑在另一个 Python 里，还把依赖装进了系统环境。现在会把
    harness 自己的解释器目录放到 PATH 最前面，并且工具描述里写明了当前是什么 shell。
+10. **`SQLiteSession` 持有连接，不关会留下 `-wal` / `-shm`。** CLI 跑完进程退出无所谓，
+    但长驻进程（比如以后的网页控制台）会泄漏句柄，所以 `Harness` 提供了 `close()`，
+    也能当上下文管理器用。
 
 ## 成本控制
 
@@ -200,9 +272,10 @@ $env:PYTHONUTF8=1
 ## 目前的局限
 
 - 进度是「事件级」而不是「token 级」：能看到 agent 和工具调用，看不到逐字输出。
-- 没有会话持久化和断点续跑，每次 `run()` 都是一次性的。
+- 会话能记住上下文，但一次**被中断的运行**还不能接着跑（SDK 的 `RunState` 还没接）。
 - 没有并发，worker 是串行逐个调用的。
-- 没有把 `runs/` 的产物做成回放界面。
+- 运行浏览器是**只读**的：能看历史、能对比，但还不能从页面发起任务、叫停或干预。
+  这些要先补后端能力（会话持久化 → 可中断 → 审批门），不是前端的事。
 - 只有 token 统计，没有按人民币折算成本。
 - 工作区沙箱只管文件读写，管不住进程：开了 `--allow-shell` 后 agent 仍能在
   本机执行任意命令（有超时和拒绝列表，但那是防手滑，不是隔离）。

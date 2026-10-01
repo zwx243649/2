@@ -83,6 +83,10 @@ class ScriptedModel(Model):
             {
                 "agent_instructions": system_instructions,
                 "tools": sorted(tool.name for tool in tools),
+                # 保留原始输入，便于断言「会话上下文有没有带上」
+                "input_items": list(input)
+                if isinstance(input, list)
+                else [{"role": "user", "content": input}],
             }
         )
 

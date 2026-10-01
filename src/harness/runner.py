@@ -24,8 +24,11 @@ from .agents import apply_strict_policy, build_supervisor, build_workers
 from .config import HarnessConfig
 from .progress import Emitter, ProgressHooks
 from .provider import build_model, build_model_settings
+from .runs_index import SUMMARY_FILENAME, build_summary
+from .sessions import open_conversation
 from .tools import build_read_tools, build_shell_tools, build_write_tools
 from .tracing import LocalTraceProcessor
+from .usage import TokenUsage, summarize_usage
 from .workspace import Workspace
 
 WORKFLOW_NAME = "multi-agent-harness"
@@ -96,49 +99,6 @@ def render_transcript(entries: list[dict[str, Any]]) -> str:
 
 
 @dataclass
-class TokenUsage:
-    """从 generation span 汇总出来的真实消耗。"""
-
-    calls: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
-    reasoning_tokens: int = 0
-    cached_tokens: int = 0
-    total_tokens: int = 0
-
-    def render(self) -> str:
-        parts = [f"{self.calls} 次调用", f"输入 {self.input_tokens}", f"输出 {self.output_tokens}"]
-        if self.reasoning_tokens:
-            parts.append(f"其中思维链 {self.reasoning_tokens}")
-        if self.cached_tokens:
-            parts.append(f"缓存命中 {self.cached_tokens}")
-        parts.append(f"合计 {self.total_tokens} tokens")
-        return "，".join(parts)
-
-
-def summarize_usage(spans: list[dict[str, Any]]) -> TokenUsage:
-    usage = TokenUsage()
-    for span in spans:
-        if span.get("type") != "generation":
-            continue
-        # 有 generation span 就算一次模型调用，哪怕服务端没返回 usage
-        usage.calls += 1
-        raw = span.get("usage")
-        if not isinstance(raw, dict):
-            continue
-        details_in = raw.get("input_tokens_details")
-        details_out = raw.get("output_tokens_details")
-        usage.input_tokens += raw.get("input_tokens", 0) or 0
-        usage.output_tokens += raw.get("output_tokens", 0) or 0
-        usage.total_tokens += raw.get("total_tokens", 0) or 0
-        if isinstance(details_in, dict):
-            usage.cached_tokens += details_in.get("cached_tokens", 0) or 0
-        if isinstance(details_out, dict):
-            usage.reasoning_tokens += details_out.get("reasoning_tokens", 0) or 0
-    return usage
-
-
-@dataclass
 class RunOutcome:
     goal: str
     final_output: str
@@ -148,6 +108,7 @@ class RunOutcome:
     spans: list[dict[str, Any]] = field(default_factory=list)
     timeline: str = ""
     run_dir: Path | None = None
+    session_id: str | None = None
 
     @property
     def model_calls(self) -> int:
@@ -188,6 +149,7 @@ class Harness:
         self.config = config
         self.processor = LocalTraceProcessor()
         self.progress = ProgressHooks()
+        self._conversations: dict[str, Any] = {}
         self._configure_tracing()
 
         self.workspace = Workspace(config.workspace)
@@ -229,12 +191,23 @@ class Harness:
 
     # ---- 运行 ----
 
-    async def run(self, goal: str, on_event: Emitter | None = None) -> RunOutcome:
-        """跑一次任务。传了 on_event 就会实时收到 agent / tool 的进度事件。"""
+    async def run(
+        self,
+        goal: str,
+        *,
+        session_id: str | None = None,
+        on_event: Emitter | None = None,
+    ) -> RunOutcome:
+        """跑一次任务。
+
+        - ``on_event``：实时进度回调
+        - ``session_id``：带上它就能复用同名会话的历史，实现多轮追问
+        """
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal 不能为空")
 
+        session = self._conversation(session_id) if session_id else None
         self.processor.reset()
         started = time.perf_counter()
 
@@ -245,6 +218,7 @@ class Harness:
                 goal,
                 max_turns=self.config.max_turns,
                 hooks=self.progress,
+                session=session,
                 run_config=RunConfig(
                     workflow_name=WORKFLOW_NAME,
                     # local 模式数据不出本机，保留完整内容便于调试；
@@ -264,14 +238,48 @@ class Harness:
             transcript=serialize_items(result),
             spans=list(self.processor.spans),
             timeline=self.processor.format_timeline(),
+            session_id=session_id,
         )
 
         if self.config.save_artifacts:
             outcome.run_dir = self._persist(outcome)
         return outcome
 
-    def run_sync(self, goal: str, on_event: Emitter | None = None) -> RunOutcome:
-        return asyncio.run(self.run(goal, on_event=on_event))
+    def run_sync(
+        self,
+        goal: str,
+        *,
+        session_id: str | None = None,
+        on_event: Emitter | None = None,
+    ) -> RunOutcome:
+        return asyncio.run(self.run(goal, session_id=session_id, on_event=on_event))
+
+    def _conversation(self, session_id: str) -> Any:
+        """同一个会话只打开一次，避免重复建连接。"""
+        session = self._conversations.get(session_id)
+        if session is None:
+            session = open_conversation(session_id, self.config.sessions_db)
+            self._conversations[session_id] = session
+        return session
+
+    def close(self) -> None:
+        """关闭所有会话连接。
+
+        每个 SQLiteSession 持有连接和一把文件锁，不关就会留下 -wal / -shm；
+        CLI 跑完进程退出无所谓，但长驻进程（比如以后的网页控制台）必须调用。
+        """
+        for session in self._conversations.values():
+            try:
+                session.close()
+            except Exception:  # 关闭失败不该影响主流程
+                pass
+        self._conversations.clear()
+
+    def __enter__(self) -> Harness:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
 
     # ---- 产物 ----
 
@@ -286,6 +294,7 @@ class Harness:
 
         payload = {
             "goal": outcome.goal,
+            "session_id": outcome.session_id,
             "final_output": outcome.final_output,
             "last_agent": outcome.last_agent,
             "duration_s": round(outcome.duration_s, 3),
@@ -296,6 +305,12 @@ class Harness:
         }
         (run_dir / "run.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+            newline="\n",
+        )
+        # 顺手存一份小的，列表接口就不必去解析上面那个大文件
+        (run_dir / SUMMARY_FILENAME).write_text(
+            json.dumps(build_summary(payload), ensure_ascii=False, indent=2),
             encoding="utf-8",
             newline="\n",
         )

@@ -116,3 +116,8 @@ class HarnessConfig:
     @property
     def resolved_api_key(self) -> str | None:
         return self.api_key or os.getenv("OPENAI_API_KEY") or None
+
+    @property
+    def sessions_db(self) -> Path:
+        """会话的对话历史数据库。放在 runs_dir 下，和运行产物在一起。"""
+        return self.runs_dir / "sessions.db"

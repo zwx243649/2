@@ -111,6 +111,25 @@ async def test_artifacts_are_written(tmp_path):
     assert (outcome.run_dir / "timeline.txt").exists()
 
 
+async def test_run_writes_a_small_summary_alongside_the_full_record(tmp_path):
+    """列表接口靠这份小文件，不必解析完整记录。"""
+    model = ScriptedModel([text_response("ok")])
+    harness = Harness(make_config(tmp_path), model=model)
+
+    outcome = await harness.run("写摘要")
+
+    full = outcome.run_dir / "run.json"
+    small = outcome.run_dir / "summary.json"
+    assert small.is_file()
+    # 这正是优化点：完整记录比摘要大一个数量级
+    assert full.stat().st_size > small.stat().st_size * 5
+    # 完整记录里有 spans，摘要里不该有
+    payload = json.loads(small.read_text(encoding="utf-8"))
+    assert "spans" not in payload
+    assert "transcript" not in payload
+    assert payload["goal"] == "写摘要"
+
+
 async def test_shell_tool_is_absent_until_enabled(tmp_path):
     model = ScriptedModel([text_response("ok")])
     harness = Harness(make_config(tmp_path), model=model)
