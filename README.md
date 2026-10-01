@@ -48,7 +48,7 @@ src/harness/
   web/          运行浏览器的单页前端
   cli.py        命令行入口
   testing.py    ScriptedModel，离线测试编排用
-tests/          98 个测试，全部离线可跑
+tests/          112 个测试，全部离线可跑
 examples/       offline_demo.py
 ```
 
@@ -199,6 +199,50 @@ HARNESS_MODEL=qwen3:8b
 worker 拿不到 supervisor 的对话，所以 supervisor 必须把相关背景写进委派内容里
 ——这正是它提示词里「委派必须自包含」那条规则。
 
+## 审批门
+
+开了 shell 之后，**每条命令执行前都要你点头**：
+
+```powershell
+> harness --allow-shell "新建 greet.py 并运行确认输出"
+> supervisor
+  . coder({"input": "..."})
+  > coder
+    . write_file({"path": "greet.py", ...})
+    . write_file -> 已写入 greet.py（15 字符）
+
+⏸ 已暂停：有工具调用在等待你批准
+
+  [run_command] {"command": "python greet.py"}
+
+批准：harness --approve 20261001-154213
+拒绝：harness --reject 20261001-154213
+```
+
+```powershell
+harness --pending              # 看还有哪些在等
+harness --approve <run_id>     # 放行并继续
+harness --reject  <run_id>     # 拒绝并继续（模型会如实报告验证没做成）
+```
+
+**批准之前命令不会执行**，这是有测试兜底的核心断言。
+
+直接动机是一次真实事故：agent 自己跑了 `pip install pytest`，把包装进了系统 Python。
+它有 shell 权限，但没人授权它装东西。
+
+几个设计决定：
+
+- **默认就要审批**（`HARNESS_APPROVE_SHELL=1`）。开 shell 只代表「允许执行」，
+  不代表「随便执行」。
+- **暂停时落盘完整运行状态**（`runs/<id>/state.json`），所以可以关掉终端、
+  第二天再批准。状态由 SDK 的 `RunState` 序列化，续跑走 `RunState.from_string`。
+- **续跑会自动恢复原运行的工具配置。** 这条是踩出来的：原运行带了 `--allow-shell`，
+  批准时忘了带，coder 的工具列表里就没有 `run_command`，运行会**永远卡在同一个
+  暂停点**且看不出原因。现在配置随记录一起存（`graph_config`），续跑自动套用，
+  不一致就直接报错。
+- **`status` 从 `state.json` 是否存在推导**，不存进文件。存下来的话，续跑清掉
+  状态标记后，那句 "paused" 就会一直留在记录里说谎。
+
 ## 踩过的坑
 
 这几条都是实际调试出来的，不是推测：
@@ -223,6 +267,11 @@ worker 拿不到 supervisor 的对话，所以 supervisor 必须把相关背景�
 10. **`SQLiteSession` 持有连接，不关会留下 `-wal` / `-shm`。** CLI 跑完进程退出无所谓，
     但长驻进程（比如以后的网页控制台）会泄漏句柄，所以 `Harness` 提供了 `close()`，
     也能当上下文管理器用。
+11. **续跑必须用和原运行相同的工具配置。** 少了 `--allow-shell`，待执行的
+    `run_command` 在新建的 agent 图里根本不存在，运行会无声地卡在同一个暂停点。
+12. **中断可能发生在嵌套的 worker 里。** `result.interruptions` 会把 worker 内部的
+    待批准调用冒泡上来，续跑时父级会重放委派、由嵌套状态接着跑 —— 所以
+    `write_file` 不会重复执行。这点是验证过的，别凭直觉去「优化」它。
 
 ## 成本控制
 

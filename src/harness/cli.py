@@ -12,6 +12,14 @@ from .server import DEFAULT_PORT
 from .server import serve as serve_runs
 from .sessions import InvalidSessionId, validate_session_id
 
+NO_CREDENTIALS_HINT = (
+    "还没有配置模型凭据。二选一：\n"
+    "  1) 复制 .env.example 为 .env，填 HARNESS_API_KEY\n"
+    "  2) 设置 HARNESS_BASE_URL 指向你的 OpenAI 兼容端点"
+    "（如本地 Ollama: http://localhost:11434/v1）\n"
+    "也可以先跑 python examples/offline_demo.py 看流程。"
+)
+
 
 def _list_sessions(config: HarnessConfig) -> int:
     from .runs_index import list_sessions
@@ -29,6 +37,68 @@ def _list_sessions(config: HarnessConfig) -> int:
             f"{item.last_run:<16} {title}"
         )
     return 0
+
+
+def _list_pending(config: HarnessConfig) -> int:
+    from .runs_index import list_pending
+
+    items = list_pending(config.runs_dir)
+    if not items:
+        print("没有等待批准的工具调用。")
+        return 0
+
+    for item in items:
+        print(f"{item.run_id}  {item.display_time}  {item.goal[:50]}")
+        for call in item.pending:
+            print(f"    待批准 [{call.get('tool')}] {call.get('arguments')}")
+        print(f"    批准: python -m harness --approve {item.run_id}")
+        print(f"    拒绝: python -m harness --reject {item.run_id}")
+    return 0
+
+
+def _run_resume(config: HarnessConfig, run_id: str, approve: bool, quiet: bool) -> int:
+    from .runs_index import load_graph_config
+
+    try:
+        stored = load_graph_config(config.runs_dir, run_id)
+    except Exception as exc:
+        print(f"读取运行记录失败: {exc}", file=sys.stderr)
+        return 2
+
+    if stored:
+        # 工具配置不跟着一起恢复的话，待执行的工具在新建的图里不存在，
+        # 会永远卡在同一个暂停点。
+        config = config.with_overrides(**stored)
+        print(f"已恢复该次运行的配置: {stored}", file=sys.stderr)
+
+    try:
+        harness = Harness(config)
+    except Exception as exc:
+        print(f"初始化失败: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        outcome = harness.resume_sync(
+            run_id, approve=approve, on_event=None if quiet else ConsoleReporter()
+        )
+    except FileNotFoundError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\n已中断。", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"续跑失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        harness.close()
+
+    print(outcome.render())
+    return 0
+
+
+def _has_credentials(config: HarnessConfig) -> bool:
+    return config.resolved_api_key is not None or config.base_url is not None
 
 
 def _serve(config: HarnessConfig, port: int) -> int:
@@ -112,6 +182,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="列出所有会话后退出",
     )
     parser.add_argument(
+        "--pending",
+        action="store_true",
+        help="列出正在等待批准的工具调用",
+    )
+    parser.add_argument(
+        "--approve",
+        metavar="RUN_ID",
+        help="批准某次暂停运行里的待执行工具，并继续运行",
+    )
+    parser.add_argument(
+        "--reject",
+        metavar="RUN_ID",
+        help="拒绝该工具调用，并继续运行",
+    )
+    parser.add_argument(
         "--quiet",
         "-q",
         action="store_true",
@@ -188,6 +273,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_sessions:
         return _list_sessions(config)
 
+    if args.pending:
+        return _list_pending(config)
+
+    action = args.approve or args.reject
+    if action:
+        if not _has_credentials(config):
+            print(NO_CREDENTIALS_HINT, file=sys.stderr)
+            return 2
+        return _run_resume(
+            config, action, approve=bool(args.approve), quiet=args.quiet
+        )
+
     if args.session:
         try:
             validate_session_id(args.session)
@@ -209,15 +306,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
 
-    if config.resolved_api_key is None and config.base_url is None:
-        print(
-            "还没有配置模型凭据。二选一：\n"
-            "  1) 复制 .env.example 为 .env，填 HARNESS_API_KEY\n"
-            "  2) 设置 HARNESS_BASE_URL 指向你的 OpenAI 兼容端点"
-            "（如本地 Ollama: http://localhost:11434/v1）\n"
-            "也可以先跑 python examples/offline_demo.py 看流程。",
-            file=sys.stderr,
-        )
+    if not _has_credentials(config):
+        print(NO_CREDENTIALS_HINT, file=sys.stderr)
         return 2
 
     try:

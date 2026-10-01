@@ -14,6 +14,7 @@ from agents import (
     ItemHelpers,
     RunConfig,
     RunResult,
+    RunState,
     Runner,
     add_trace_processor,
     set_trace_processors,
@@ -32,6 +33,12 @@ from .usage import TokenUsage, summarize_usage
 from .workspace import Workspace
 
 WORKFLOW_NAME = "multi-agent-harness"
+STATE_FILENAME = "state.json"
+
+# 这几项决定 agent 图长什么样。续跑时如果和原运行不一致，待执行的工具调用
+# 在图中就找不到对应工具 —— 实测踩过：原运行带了 --allow-shell，续跑忘了带，
+# coder 的工具列表里根本没有 run_command，于是永远卡在同一个暂停点。
+GRAPH_CONFIG_KEYS = ("model", "allow_shell", "approve_shell", "strict_tools")
 
 
 def _clip(value: Any, limit: int = 600) -> str | None:
@@ -79,6 +86,22 @@ def serialize_items(result: RunResult) -> list[dict[str, Any]]:
     return entries
 
 
+def describe_interruptions(interruptions: list[Any]) -> list[dict[str, Any]]:
+    """把待批准的工具调用转成可读、可序列化的形式。"""
+    pending: list[dict[str, Any]] = []
+    for item in interruptions:
+        raw = getattr(item, "raw_item", None)
+        pending.append(
+            {
+                "tool": getattr(item, "tool_name", None)
+                or getattr(raw, "name", "")
+                or "?",
+                "arguments": getattr(raw, "arguments", "") or "",
+            }
+        )
+    return pending
+
+
 def render_transcript(entries: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for index, entry in enumerate(entries, start=1):
@@ -108,7 +131,11 @@ class RunOutcome:
     spans: list[dict[str, Any]] = field(default_factory=list)
     timeline: str = ""
     run_dir: Path | None = None
+    run_id: str | None = None
     session_id: str | None = None
+    status: str = "completed"  # completed | paused
+    pending: list[dict[str, Any]] = field(default_factory=list)
+    resumed_from: str | None = None
 
     @property
     def model_calls(self) -> int:
@@ -119,6 +146,26 @@ class RunOutcome:
         return summarize_usage(self.spans)
 
     def render(self, *, verbose: bool = False) -> str:
+        if self.status == "paused":
+            head = [
+                "=" * 60,
+                f"目标\n{self.goal}",
+                "-" * 60,
+                "⏸ 已暂停：有工具调用在等待你批准",
+                "",
+            ]
+            for item in self.pending:
+                head.append(f"  [{item['tool']}] {item['arguments']}")
+            head += [
+                "",
+                f"批准：python -m harness --approve {self.run_id or '(见运行目录)'}",
+                f"拒绝：python -m harness --reject {self.run_id or '(见运行目录)'}",
+            ]
+            if self.run_dir is not None:
+                head.append(f"运行产物: {self.run_dir}")
+            head.append("=" * 60)
+            return "\n".join(head)
+
         parts = [
             "=" * 60,
             f"目标\n{self.goal}",
@@ -230,19 +277,23 @@ class Harness:
             self.progress.set_emitter(None)
 
         duration = time.perf_counter() - started
+        interruptions = list(result.interruptions)
         outcome = RunOutcome(
             goal=goal,
-            final_output=str(result.final_output),
+            final_output="" if interruptions else str(result.final_output),
             last_agent=result.last_agent.name,
             duration_s=duration,
             transcript=serialize_items(result),
             spans=list(self.processor.spans),
             timeline=self.processor.format_timeline(),
             session_id=session_id,
+            status="paused" if interruptions else "completed",
+            pending=describe_interruptions(interruptions),
         )
 
         if self.config.save_artifacts:
-            outcome.run_dir = self._persist(outcome)
+            outcome.run_dir = self._persist(outcome, result)
+            outcome.run_id = outcome.run_dir.name
         return outcome
 
     def run_sync(
@@ -254,6 +305,90 @@ class Harness:
     ) -> RunOutcome:
         return asyncio.run(self.run(goal, session_id=session_id, on_event=on_event))
 
+    def resume_sync(
+        self,
+        run_id: str,
+        *,
+        approve: bool = True,
+        on_event: Emitter | None = None,
+    ) -> RunOutcome:
+        return asyncio.run(self.resume(run_id, approve=approve, on_event=on_event))
+
+    async def resume(
+        self,
+        run_id: str,
+        *,
+        approve: bool = True,
+        on_event: Emitter | None = None,
+    ) -> RunOutcome:
+        """从暂停的运行继续。approve=True 放行待批准的调用，False 则拒绝它。"""
+        run_dir = self.config.runs_dir / run_id
+        state_path = run_dir / STATE_FILENAME
+        if not state_path.is_file():
+            raise FileNotFoundError(f"{run_id} 没有待批准的调用（找不到 state.json）")
+
+        original = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        stored_graph = original.get("graph_config")
+        if isinstance(stored_graph, dict):
+            current = self._graph_config()
+            diff = {
+                key: {"原运行": stored_graph.get(key), "当前": current.get(key)}
+                for key in GRAPH_CONFIG_KEYS
+                if key in stored_graph and stored_graph.get(key) != current.get(key)
+            }
+            if diff:
+                raise ValueError(f"续跑需要和原运行相同的工具配置，但不一致：{diff}")
+
+        state = await RunState.from_string(
+            self.supervisor, state_path.read_text(encoding="utf-8")
+        )
+        for item in state.get_interruptions():
+            if approve:
+                state.approve(item)
+            else:
+                state.reject(item)
+
+        self.processor.reset()
+        started = time.perf_counter()
+        self.progress.set_emitter(on_event)
+        try:
+            result = await Runner.run(
+                self.supervisor,
+                state,
+                max_turns=self.config.max_turns,
+                hooks=self.progress,
+                run_config=RunConfig(
+                    workflow_name=WORKFLOW_NAME,
+                    trace_include_sensitive_data=self.config.tracing != "openai",
+                ),
+            )
+        finally:
+            self.progress.set_emitter(None)
+
+        # 续跑成功后才清掉待处理标记；失败的话状态还在，可以重试
+        state_path.unlink(missing_ok=True)
+
+        duration = time.perf_counter() - started
+        interruptions = list(result.interruptions)
+        outcome = RunOutcome(
+            goal=str(original.get("goal", "")),
+            final_output="" if interruptions else str(result.final_output),
+            last_agent=result.last_agent.name,
+            duration_s=duration,
+            transcript=serialize_items(result),
+            spans=list(self.processor.spans),
+            timeline=self.processor.format_timeline(),
+            session_id=original.get("session_id"),
+            status="paused" if interruptions else "completed",
+            pending=describe_interruptions(interruptions),
+            resumed_from=run_id,
+        )
+
+        if self.config.save_artifacts:
+            outcome.run_dir = self._persist(outcome, result)
+            outcome.run_id = outcome.run_dir.name
+        return outcome
+
     def _conversation(self, session_id: str) -> Any:
         """同一个会话只打开一次，避免重复建连接。"""
         session = self._conversations.get(session_id)
@@ -261,6 +396,10 @@ class Harness:
             session = open_conversation(session_id, self.config.sessions_db)
             self._conversations[session_id] = session
         return session
+
+    def _graph_config(self) -> dict[str, Any]:
+        """决定 agent 图形态的那几项配置。"""
+        return {key: getattr(self.config, key) for key in GRAPH_CONFIG_KEYS}
 
     def close(self) -> None:
         """关闭所有会话连接。
@@ -283,7 +422,7 @@ class Harness:
 
     # ---- 产物 ----
 
-    def _persist(self, outcome: RunOutcome) -> Path:
+    def _persist(self, outcome: RunOutcome, result: RunResult) -> Path:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         run_dir = self.config.runs_dir / stamp
         suffix = 1
@@ -302,6 +441,10 @@ class Harness:
             "usage": outcome.usage.__dict__,
             "transcript": outcome.transcript,
             "spans": outcome.spans,
+            "status": outcome.status,
+            "pending": outcome.pending,
+            "resumed_from": outcome.resumed_from,
+            "graph_config": self._graph_config(),
         }
         (run_dir / "run.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -324,6 +467,13 @@ class Harness:
             encoding="utf-8",
             newline="\n",
         )
+        if outcome.status == "paused":
+            # 完整运行状态，用于之后从暂停点继续
+            (run_dir / STATE_FILENAME).write_text(
+                result.to_state().to_string(),
+                encoding="utf-8",
+                newline="\n",
+            )
         return run_dir
 
 

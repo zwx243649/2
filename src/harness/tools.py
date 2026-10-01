@@ -126,6 +126,7 @@ def build_shell_tools(config: HarnessConfig, workspace: Workspace) -> list[Funct
     @function_tool(
         strict_mode=config.strict_tools,
         description_override=_shell_description(),
+        needs_approval=config.approve_shell,
     )
     def run_command(command: str) -> str:
         """占位 docstring；真实描述见 description_override。"""

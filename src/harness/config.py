@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,7 @@ class HarnessConfig:
     max_turns: int = DEFAULT_MAX_TURNS
     worker_max_turns: int = DEFAULT_WORKER_MAX_TURNS
     allow_shell: bool = False
+    approve_shell: bool = True
     shell_timeout: float = DEFAULT_SHELL_TIMEOUT
     strict_tools: bool = False
     thinking: str = "default"
@@ -104,6 +105,7 @@ class HarnessConfig:
                 "HARNESS_WORKER_MAX_TURNS", DEFAULT_WORKER_MAX_TURNS
             ),
             "allow_shell": _env_bool("HARNESS_ALLOW_SHELL", False),
+            "approve_shell": _env_bool("HARNESS_APPROVE_SHELL", True),
             "shell_timeout": _env_float("HARNESS_SHELL_TIMEOUT", DEFAULT_SHELL_TIMEOUT),
             "strict_tools": _env_bool("HARNESS_STRICT_TOOLS", False),
             "thinking": (os.getenv("HARNESS_THINKING") or "default").strip().lower(),
@@ -116,6 +118,11 @@ class HarnessConfig:
     @property
     def resolved_api_key(self) -> str | None:
         return self.api_key or os.getenv("OPENAI_API_KEY") or None
+
+    def with_overrides(self, **overrides: Any) -> HarnessConfig:
+        """基于当前配置生成一份改过的副本（None 表示不改）。"""
+        clean = {key: value for key, value in overrides.items() if value is not None}
+        return replace(self, **clean) if clean else self
 
     @property
     def sessions_db(self) -> Path:

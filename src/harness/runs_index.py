@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import re
 import ast
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +18,19 @@ from .usage import summarize_usage
 RUN_ID_PATTERN = re.compile(r"^\d{8}-\d{6}(-\d+)?$")
 
 SUMMARY_FILENAME = "summary.json"
+STATE_FILENAME = "state.json"
 
 # 列表只需要这几个标量字段。完整 run.json 里 spans 占了九成以上，
 # 为了列个表去解析它是纯浪费。
-SUMMARY_KEYS = ("goal", "session_id", "last_agent", "duration_s", "model_calls", "usage")
+SUMMARY_KEYS = (
+    "goal",
+    "session_id",
+    "last_agent",
+    "duration_s",
+    "model_calls",
+    "usage",
+    "pending",
+)
 
 
 def build_summary(data: dict[str, Any]) -> dict[str, Any]:
@@ -55,6 +64,9 @@ class RunSummary:
     cached_tokens: int
     total_tokens: int
     session_id: str | None = None
+    # 由 state.json 是否存在推导，不存进文件，避免和实际状态脱节
+    status: str = "completed"
+    pending: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def display_time(self) -> str:
@@ -157,9 +169,12 @@ def _normalize_spans(spans: list[Any]) -> list[dict[str, Any]]:
     return out
 
 
-def summarize_run(run_id: str, data: dict[str, Any]) -> RunSummary:
+def summarize_run(
+    run_id: str, data: dict[str, Any], *, paused: bool = False
+) -> RunSummary:
     usage = _extract_usage(data)
     session_id = data.get("session_id")
+    pending = data.get("pending")
     return RunSummary(
         run_id=run_id,
         goal=str(data.get("goal", "")),
@@ -167,6 +182,8 @@ def summarize_run(run_id: str, data: dict[str, Any]) -> RunSummary:
         duration_s=float(data.get("duration_s", 0.0) or 0.0),
         model_calls=int(data.get("model_calls", 0) or 0),
         session_id=str(session_id) if session_id else None,
+        status="paused" if paused else "completed",
+        pending=pending if isinstance(pending, list) else [],
         **usage,
     )
 
@@ -182,7 +199,13 @@ def list_runs(runs_dir: Path) -> list[RunSummary]:
         if not entry.is_dir() or not RUN_ID_PATTERN.match(entry.name):
             continue
         try:
-            summaries.append(summarize_run(entry.name, _read_summary(entry)))
+            summaries.append(
+                summarize_run(
+                    entry.name,
+                    _read_summary(entry),
+                    paused=(entry / STATE_FILENAME).is_file(),
+                )
+            )
         except (RunNotFound, json.JSONDecodeError, OSError):
             continue
 
@@ -218,12 +241,19 @@ def list_sessions(runs_dir: Path) -> list[SessionInfo]:
     return [info for _, info in sessions]
 
 
+def list_pending(runs_dir: Path) -> list[RunSummary]:
+    """还没处理完的暂停运行（有新到旧的顺序）。"""
+    return [item for item in list_runs(runs_dir) if item.status == "paused"]
+
+
 def load_run(runs_dir: Path, run_id: str) -> dict[str, Any]:
     """返回单次运行的完整详情。"""
     run_dir = _safe_run_dir(Path(runs_dir), run_id)
     data = _read_payload(run_dir)
 
-    summary = summarize_run(run_id, data)
+    summary = summarize_run(
+        run_id, data, paused=(run_dir / STATE_FILENAME).is_file()
+    )
     return {
         "summary": summary.as_dict(),
         "final_output": str(data.get("final_output", "")),
@@ -232,15 +262,28 @@ def load_run(runs_dir: Path, run_id: str) -> dict[str, Any]:
     }
 
 
+def load_graph_config(runs_dir: Path, run_id: str) -> dict[str, Any]:
+    """读取某次运行当时决定 agent 图形态的配置。
+
+    续跑必须用它 —— 配置不一致的话，待执行的工具在新建的图里根本不存在。
+    """
+    data = _read_payload(_safe_run_dir(Path(runs_dir), run_id))
+    stored = data.get("graph_config")
+    return stored if isinstance(stored, dict) else {}
+
+
 __all__ = [
     "RUN_ID_PATTERN",
+    "STATE_FILENAME",
     "SUMMARY_FILENAME",
     "RunNotFound",
     "RunSummary",
     "SessionInfo",
     "build_summary",
     "list_runs",
+    "list_pending",
     "list_sessions",
+    "load_graph_config",
     "load_run",
     "summarize_run",
 ]
