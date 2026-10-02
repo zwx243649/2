@@ -9,10 +9,14 @@ dist/
 .mypy_cache/
 .ruff_cache/
 
-# 运行产物
-runs/
-workspace*/
-examples/_demo_output/
+# 运行产物（注意前面加 / —— 只在仓库根生效。
+# 不加的话 evals/tasks/*/workspace/ 也会被忽略，用例就废了）
+/runs/
+/workspace*/
+/examples/_demo_output/
+
+# 评估产物（运行记录、失败现场）
+evals/_out/
 
 # 临时文件
 *.log

@@ -1,0 +1,6 @@
+{
+  "id": "chunk_remainder",
+  "goal": "工作区里有代码和测试。运行 python -m pytest -q 会看到失败 —— 请修好实现让整个测试套件通过。不要修改测试文件。",
+  "category": "boundary",
+  "difficulty": "easy"
+}
