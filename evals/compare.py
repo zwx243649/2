@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import math
 import sys
 from pathlib import Path
@@ -26,10 +27,8 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
 
 
 def main() -> int:
-    try:
+    with contextlib.suppress(AttributeError, ValueError):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
 
     files = sorted(OUT.glob("*.json"))
     if not files:
@@ -61,7 +60,7 @@ def main() -> int:
     print()
     print("汇总\n")
     total_k = total_n = 0
-    for name, rep in zip(names, reports):
+    for name, rep in zip(names, reports, strict=True):
         k, n = rep["passed"], rep["total"]
         total_k += k
         total_n += n

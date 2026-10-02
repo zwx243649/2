@@ -33,3 +33,18 @@ harness = ["web/*.html"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+exclude = [".venv", "build", "dist", "runs", "workspace*", "evals/_out"]
+
+[tool.ruff.lint]
+# 不选 ARG：RunHooks / Model / signal handler 这些接口实现必然有用不上的参数
+select = ["E", "W", "F", "B", "SIM", "C4", "PIE"]
+ignore = [
+    "E501", # 行长度由 line-length 管，不单独报
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 评估用例里的代码是**故意写坏的**，别拿常规标准要求它
+"evals/tasks/**" = ["E", "F", "B", "SIM"]

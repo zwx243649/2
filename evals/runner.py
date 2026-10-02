@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import json
 import shutil
 import subprocess
@@ -300,10 +301,8 @@ def main() -> int:
     parser.add_argument("--out", default=None, help="结果写到这个 json")
     args = parser.parse_args()
 
-    try:
+    with contextlib.suppress(AttributeError, ValueError):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
 
     tasks = list_tasks(Path(args.tasks))
     if args.list:

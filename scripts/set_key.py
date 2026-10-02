@@ -27,6 +27,7 @@ from harness.keyfile import (  # noqa: E402
     verify_key,
     write_value,
 )
+from harness.console import force_utf8_stdout  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 ENV_FILE = ROOT / ".env"
@@ -43,10 +44,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
+    force_utf8_stdout()
 
     lines = read_lines(ENV_FILE, template=ENV_TEMPLATE)
     base_url = current_value(lines, "HARNESS_BASE_URL") or DEFAULT_BASE_URL

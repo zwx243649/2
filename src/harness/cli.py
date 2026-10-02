@@ -9,6 +9,7 @@ from typing import Any
 
 from .cancel import CancelToken
 from .config import TRACING_MODES, HarnessConfig
+from .console import force_utf8_stdout
 from .server import DEFAULT_PORT
 from .server import serve as serve_runs
 from .sessions import InvalidSessionId, validate_session_id
@@ -326,10 +327,7 @@ def _describe(harness: Any) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    try:  # 避免 Windows 控制台把中文输出成乱码
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
+    force_utf8_stdout()
 
     parser = build_parser()
     args = parser.parse_args(argv)

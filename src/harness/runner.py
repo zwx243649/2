@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -551,10 +552,8 @@ class Harness:
         CLI 跑完进程退出无所谓，但长驻进程（比如以后的网页控制台）必须调用。
         """
         for session in self._conversations.values():
-            try:
+            with contextlib.suppress(Exception):  # 关闭失败不该影响主流程
                 session.close()
-            except Exception:  # 关闭失败不该影响主流程
-                pass
         self._conversations.clear()
 
     def __enter__(self) -> Harness:

@@ -200,8 +200,10 @@ def summarize_run(
     streak = data.get("regression_streak")
     if not resumable:
         status = "completed"
+    elif pending:
+        status = "paused"
     else:
-        status = "paused" if pending else "cancelled"
+        status = "cancelled"
     return RunSummary(
         run_id=run_id,
         goal=str(data.get("goal", "")),

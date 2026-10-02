@@ -10,6 +10,7 @@ worker tool，否则只能看到委派这一层，看不到 worker 内部。
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable, TextIO
@@ -60,10 +61,9 @@ class ProgressHooks(RunHooks):
     def _emit(self, event: ProgressEvent) -> None:
         if self._emitter is None:
             return
-        try:
+        # 进度输出绝不能影响主流程 —— 回调自己炸了就当没这回事
+        with contextlib.suppress(Exception):
             self._emitter(event)
-        except Exception:  # 进度输出绝不能影响主流程
-            pass
 
     async def on_agent_start(self, context: Any, agent: Any) -> None:
         self._emit(ProgressEvent("agent_start", agent.name, self._depth))

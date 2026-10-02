@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from harness import Harness, HarnessConfig  # noqa: E402
+from harness.console import force_utf8_stdout  # noqa: E402
 from harness.progress import ConsoleReporter  # noqa: E402
 from harness.testing import ScriptedModel, text_response, tool_call_response  # noqa: E402
 
@@ -56,10 +57,7 @@ def build_model() -> ScriptedModel:
 
 
 def main() -> int:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
+    force_utf8_stdout()
 
     config = HarnessConfig(
         workspace=OUTPUT_DIR / "workspace",

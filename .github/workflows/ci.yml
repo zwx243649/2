@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 安装
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: 测试
+        run: pytest -q
+
+      # 评估用例是给真实模型跑的，CI 里跑不了（要 API key、要花钱）。
+      # 但可以校验它们**合格** —— 这一步不联网、不花钱。
+      - name: 校验评估用例
+        run: python evals/check_fixtures.py

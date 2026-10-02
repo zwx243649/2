@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import re
 import shutil
 import subprocess
@@ -72,10 +73,8 @@ def count_collected(workspace: Path) -> int:
 
 
 def main() -> int:
-    try:
+    with contextlib.suppress(AttributeError, ValueError):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
 
     problems: list[str] = []
     tasks = sorted(p for p in TASKS_DIR.iterdir() if p.is_dir())
