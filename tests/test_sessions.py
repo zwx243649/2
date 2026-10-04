@@ -9,7 +9,12 @@ import pytest
 
 from harness import Harness, HarnessConfig
 from harness.runs_index import list_sessions
-from harness.sessions import InvalidSessionId, open_conversation, validate_session_id
+from harness.sessions import (
+    COMPACTION_PREFIX,
+    InvalidSessionId,
+    open_conversation,
+    validate_session_id,
+)
 from harness.testing import ScriptedModel, text_response
 
 
@@ -99,6 +104,83 @@ async def test_history_survives_a_new_harness_instance(tmp_path):
     carried = json.dumps(second_model.calls[0]["input_items"], ensure_ascii=False)
     assert "第一句话" in carried
     assert "回答一" in carried
+
+
+async def test_old_history_is_compacted_without_touching_storage(tmp_path):
+    conversation = open_conversation("demo", tmp_path / "sessions.db", max_items=5)
+    items = [
+        {"role": "user", "content": "原始目标：修好分页逻辑"},
+        {"role": "assistant", "content": "第一次回答"},
+        {"role": "user", "content": "第二个要求"},
+        {"role": "assistant", "content": "第二次回答"},
+        {"role": "user", "content": "最新要求"},
+        {"role": "assistant", "content": "最新回答"},
+    ]
+    await conversation.add_items(items)
+
+    visible = await conversation.get_items()
+    assert len(visible) == 5
+    assert visible[0]["role"] == "user"
+    assert visible[0]["content"].startswith(COMPACTION_PREFIX)
+    assert "原始目标：修好分页逻辑" in visible[0]["content"]
+    assert visible[-1] == items[-1]
+
+    # 折叠只影响模型看到的内容，原始历史一条都不能少。
+    stored = await conversation.inner.get_items()
+    assert stored == items
+
+
+async def test_compaction_can_be_disabled(tmp_path):
+    conversation = open_conversation("demo", tmp_path / "sessions.db", max_items=0)
+    items = [{"role": "user", "content": f"第 {index} 条"} for index in range(12)]
+    await conversation.add_items(items)
+
+    assert await conversation.get_items() == items
+
+
+async def test_compaction_does_not_start_with_an_orphan_tool_output(tmp_path):
+    conversation = open_conversation("demo", tmp_path / "sessions.db", max_items=3)
+    items = [
+        {"role": "user", "content": "目标"},
+        {"type": "function_call", "call_id": "c1", "name": "read_file", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "第一份输出"},
+        {"type": "function_call", "call_id": "c2", "name": "read_file", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c2", "output": "第二份输出"},
+        {"role": "assistant", "content": "阶段总结"},
+        {"type": "function_call_output", "call_id": "missing", "output": "孤立的旧输出"},
+        {"type": "function_call", "call_id": "c3", "name": "read_file", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c3", "output": "第三份输出"},
+    ]
+    await conversation.add_items(items)
+
+    visible = await conversation.get_items()
+
+    assert visible[0]["content"].startswith(COMPACTION_PREFIX)
+    # 截取点必须从 function_call 开始，不能把 c3 的输出单独留在开头。
+    assert visible[1]["type"] == "function_call"
+    assert visible[1]["call_id"] == "c3"
+
+
+async def test_harness_session_uses_the_compacted_view(tmp_path):
+    config = make_config(tmp_path).with_overrides(session_item_limit=3)
+    model = ScriptedModel(
+        [
+            text_response("回答一", "r1"),
+            text_response("回答二", "r2"),
+            text_response("回答三", "r3"),
+        ]
+    )
+    harness = Harness(config, model=model)
+
+    await harness.run("原始目标", session_id="demo")
+    await harness.run("第二句话", session_id="demo")
+    await harness.run("第三句话", session_id="demo")
+
+    third_input = json.dumps(model.calls[2]["input_items"], ensure_ascii=False)
+    assert COMPACTION_PREFIX in third_input
+    assert "原始目标" in third_input
+    assert "第二句话" in third_input
+    assert "回答二" in third_input
 
 
 async def test_run_payload_records_session_id(tmp_path):

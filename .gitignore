@@ -18,6 +18,9 @@ dist/
 # 评估产物（运行记录、失败现场）
 evals/_out/
 
+# 个人简历与其他交付物
+/deliverables/
+
 # 临时文件
 *.log
 ~$*

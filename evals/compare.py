@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import contextlib
 import math
@@ -27,10 +28,19 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="对比评估结果并给出置信区间")
+    parser.add_argument(
+        "reports",
+        nargs="*",
+        type=Path,
+        help="要对比的结果 JSON；省略时读取 evals/_out/*.json",
+    )
+    args = parser.parse_args()
+
     with contextlib.suppress(AttributeError, ValueError):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    files = sorted(OUT.glob("*.json"))
+    files = list(args.reports) if args.reports else sorted(OUT.glob("*.json"))
     if not files:
         print("还没有评估结果")
         return 1

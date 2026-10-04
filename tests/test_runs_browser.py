@@ -184,7 +184,14 @@ def test_server_serves_page_and_api(tmp_path):
     httpd, base = _start_server(tmp_path)
     try:
         page = urllib.request.urlopen(base + "/", timeout=10).read().decode("utf-8")
-        assert "Harness Runs" in page
+        assert "Harness Console" in page
+        assert "Dashboard" in page
+        assert "Sessions" in page
+        assert "Settings" in page
+        assert "127.0.0.1" not in page
+
+        app_page = urllib.request.urlopen(base + "/app", timeout=10).read().decode("utf-8")
+        assert "Harness Console" in app_page
 
         listing = json.loads(urllib.request.urlopen(base + "/api/runs", timeout=10).read())
         assert listing["runs"][0]["goal"] == "从网页看"
@@ -196,6 +203,28 @@ def test_server_serves_page_and_api(tmp_path):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_status_endpoint_exposes_safe_service_state(tmp_path):
+    write_run(
+        tmp_path,
+        "20260101-090000",
+        usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    )
+    httpd, base = _start_server(tmp_path)
+    try:
+        payload = json.loads(
+            urllib.request.urlopen(base + "/api/status", timeout=10).read()
+        )
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert payload["status"] == "ready"
+    assert payload["run_count"] == 1
+    assert payload["total_tokens"] == 15
+    assert "workspace" in payload
+    assert "api_key" not in payload
 
 
 def test_server_returns_404_for_bad_run_id(tmp_path):

@@ -45,6 +45,16 @@ def test_reading_missing_file_reports_clearly(tmp_path):
         workspace.read_text("nope.txt")
 
 
+def test_read_text_honors_a_character_budget(tmp_path):
+    workspace = Workspace(tmp_path / "ws")
+    workspace.write_text("big.txt", "x" * 500)
+
+    body = workspace.read_text("big.txt", max_chars=120)
+
+    assert body.startswith("x" * 120)
+    assert "已截断" in body
+
+
 # ---- 精确替换（edit_file 的底座）----
 
 

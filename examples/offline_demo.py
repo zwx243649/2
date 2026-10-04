@@ -63,6 +63,8 @@ def main() -> int:
         workspace=OUTPUT_DIR / "workspace",
         runs_dir=OUTPUT_DIR / "runs",
         tracing="local",
+        # 这个 demo 专门展示 supervisor + worker 全链路。
+        routing_mode="off",
     )
     harness = Harness(config, model=build_model())
     print("=== 实时进度（stderr）===", file=sys.stderr)

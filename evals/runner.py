@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import concurrent.futures
 import json
 import shutil
 import subprocess
@@ -212,7 +213,8 @@ def run_task(meta: dict, *, model: str | None = None) -> TaskResult:
     before = _snapshot(workspace)
     specs_before = _specs(workspace)
 
-    runs_dir = OUT_DIR / "runs"
+    # 每个用例单独一个 runs 目录：并行跑时不会因为同一秒落盘而互相覆盖。
+    runs_dir = OUT_DIR / "runs" / task_id
     # 用 from_env 才能读到 .env 里的 base_url / api_key，
     # 直接构造 HarnessConfig 会退回 SDK 默认的 OpenAI provider
     config = HarnessConfig.from_env(
@@ -292,11 +294,69 @@ def run_task(meta: dict, *, model: str | None = None) -> TaskResult:
     return result
 
 
+def write_report(path: Path, report: Report) -> None:
+    """把当前结果写入磁盘。
+
+    每跑完一个用例就写一次，网络中断时已完成的样本不会丢。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "pass_at_1": report.pass_at_1,
+                "passed": report.passed,
+                "total": len(report.results),
+                "cheated": report.cheated,
+                "results": [asdict(r) for r in report.results],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def run_all(
+    tasks: list[dict], *, model: str | None, workers: int
+) -> list[TaskResult]:
+    """并行执行用例，按完成顺序返回结果。
+
+    用进程而不是线程：Agents SDK 的 tracing 开关是进程级全局状态，
+    同一个进程里并发跑两个 Harness 会互相覆盖。
+    """
+    if workers <= 1:
+        return [run_task(meta, model=model) for meta in tasks]
+
+    results: list[TaskResult] = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(run_task, meta, model=model): meta for meta in tasks
+        }
+        for future in concurrent.futures.as_completed(futures):
+            meta = futures[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:  # 子进程崩了也要留下可诊断结果
+                results.append(
+                    TaskResult(
+                        task_id=meta["id"],
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="跑 harness 的评估集")
     parser.add_argument("--tasks", default=str(TASKS_DIR))
     parser.add_argument("--model", default=None)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=3,
+        help="并行执行用例的进程数（默认 3，设为 1 可顺序调试）",
+    )
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--out", default=None, help="结果写到这个 json")
     args = parser.parse_args()
@@ -319,14 +379,20 @@ def main() -> int:
     if not tasks:
         print("没有找到用例", file=sys.stderr)
         return 1
+    if args.workers < 1:
+        print("--workers 必须 >= 1", file=sys.stderr)
+        return 1
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     report = Report()
     total = len(tasks)
-    for index, meta in enumerate(tasks, start=1):
-        print(f"[{index}/{total}] {meta['id']} …", flush=True)
-        result = run_task(meta, model=args.model)
+    order = {meta["id"]: index for index, meta in enumerate(tasks)}
+    for completed, result in enumerate(
+        run_all(tasks, model=args.model, workers=args.workers), start=1
+    ):
         report.results.append(result)
+        if args.out:
+            write_report(Path(args.out), report)
         mark = "通过" if result.passed else "失败"
         flags = ""
         if result.tests_modified:
@@ -334,29 +400,17 @@ def main() -> int:
         if result.spec_modified:
             flags += "  [改了文档串]"
         print(
-            f"    {mark}  {result.tokens:,} tokens  "
+            f"[{completed}/{total}] {result.task_id}  {mark}  {result.tokens:,} tokens  "
             f"{result.model_calls} calls  {result.duration_s:.0f}s{flags}",
             flush=True,
         )
 
+    report.results.sort(key=lambda item: order.get(item.task_id, total))
     print()
     print(report.summary())
 
     if args.out:
-        Path(args.out).write_text(
-            json.dumps(
-                {
-                    "pass_at_1": report.pass_at_1,
-                    "passed": report.passed,
-                    "total": len(report.results),
-                    "cheated": report.cheated,
-                    "results": [asdict(r) for r in report.results],
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        write_report(Path(args.out), report)
         print(f"\n结果已写入 {args.out}")
     return 0
 

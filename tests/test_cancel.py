@@ -76,6 +76,31 @@ async def test_cancelled_run_can_be_resumed(tmp_path):
     assert resumed.resumed_from == cancelled.run_id
 
 
+async def test_fast_path_cancelled_run_resumes_with_the_same_route(tmp_path):
+    model = ScriptedModel(
+        [
+            tool_call_response(
+                "write_file", {"path": "a.txt", "content": "hi"}, call_id="f1"
+            ),
+            text_response("快速路径完成", response_id="f2"),
+        ]
+    )
+    harness = Harness(make_config(tmp_path, routing_mode="auto"), model=model)
+    token = CancelToken()
+    token.cancel()
+
+    cancelled = await harness.run("写一个 a.txt", cancel_token=token)
+
+    assert cancelled.execution_route == "coder"
+    assert (cancelled.run_dir / STATE_FILENAME).is_file()
+
+    resumed = await harness.resume(cancelled.run_id, approve=True)
+
+    assert resumed.execution_route == "coder"
+    assert resumed.status == "completed"
+    assert resumed.final_output == "快速路径完成"
+
+
 async def test_cancelled_run_shows_up_as_cancelled_not_paused(tmp_path):
     """被停止的运行没有待批准项，不该混进「等批准」那一类。"""
     harness = Harness(make_config(tmp_path), model=write_script())

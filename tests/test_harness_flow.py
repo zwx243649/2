@@ -11,6 +11,8 @@ def make_config(tmp_path, **overrides):
         "workspace": tmp_path / "workspace",
         "runs_dir": tmp_path / "runs",
         "tracing": "local",
+        # 这些测试验证的是 supervisor + worker 图；快速路由单独测试。
+        "routing_mode": "off",
     }
     defaults.update(overrides)
     return HarnessConfig(**defaults)
@@ -185,3 +187,56 @@ async def test_worker_edits_a_file_without_shell_or_approval(tmp_path):
     assert outcome.status == "completed"
     assert outcome.pending == []
     assert (workspace / "a.py").read_text(encoding="utf-8") == "import new\n"
+
+
+async def test_simple_task_uses_fast_path_without_supervisor(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "a.py").write_text("value = 1\n", encoding="utf-8")
+    model = ScriptedModel(
+        [
+            tool_call_response(
+                "read_file", {"path": "a.py"}, call_id="read-1"
+            ),
+            text_response("已读取并处理 a.py", response_id="fast-1"),
+        ]
+    )
+    harness = Harness(make_config(tmp_path, routing_mode="auto"), model=model)
+
+    outcome = await harness.run("修复 a.py 里的边界问题")
+
+    assert outcome.execution_route == "coder"
+    assert outcome.last_agent == "coder"
+    assert outcome.model_calls == 2
+    assert "researcher" not in model.calls[0]["tools"]
+    assert "coder" not in model.calls[0]["tools"]
+
+
+async def test_worker_contexts_do_not_share_read_deduplication(tmp_path):
+    """researcher 读过的内容，coder 仍然必须能完整读到。"""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    content = "important line\n" * 20
+    (workspace / "a.txt").write_text(content, encoding="utf-8")
+    model = ScriptedModel(
+        [
+            tool_call_response("researcher", {"input": "读 a.txt"}, call_id="s1"),
+            tool_call_response(
+                "read_file", {"path": "a.txt"}, call_id="r1"
+            ),
+            text_response("researcher 完成", response_id="r2"),
+            tool_call_response("coder", {"input": "再读 a.txt"}, call_id="s2"),
+            tool_call_response(
+                "read_file", {"path": "a.txt"}, call_id="c1"
+            ),
+            text_response("coder 完成", response_id="c2"),
+            text_response("全部完成", response_id="s3"),
+        ]
+    )
+    harness = Harness(make_config(tmp_path), model=model)
+
+    await harness.run("先调研再实现")
+
+    coder_input = json.dumps(model.calls[5]["input_items"], ensure_ascii=False)
+    assert "important line" in coder_input
+    assert "重复内容已省略" not in coder_input

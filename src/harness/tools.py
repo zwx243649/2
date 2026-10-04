@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import locale
 import os
 import subprocess
@@ -77,8 +78,36 @@ def _shell_description() -> str:
     )
 
 
-def build_read_tools(workspace: Workspace, *, strict: bool = False) -> list[FunctionTool]:
+class ToolResultCache:
+    """一次运行内的工具结果去重。
+
+    工具输出会留在后续每一轮上下文里，重复内容比重复磁盘读取贵得多。
+    """
+
+    def __init__(self, *, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self._seen: dict[tuple[str, str], str] = {}
+
+    def remember(self, kind: str, key: str, value: str) -> str:
+        if not self.enabled or len(value) < 120:
+            return value
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        previous = self._seen.get((kind, key))
+        self._seen[(kind, key)] = digest
+        if previous == digest:
+            return f"[重复内容已省略：本次运行上次读取的 {kind} 没有变化]"
+        return value
+
+
+def build_read_tools(
+    workspace: Workspace,
+    *,
+    strict: bool = False,
+    dedupe: bool = False,
+    max_output_chars: int | None = None,
+) -> list[FunctionTool]:
     """只读工具：所有 worker 都可以拿。"""
+    cache = ToolResultCache(enabled=dedupe)
 
     @function_tool(strict_mode=strict)
     def list_files(pattern: str = "**/*") -> str:
@@ -90,7 +119,7 @@ def build_read_tools(workspace: Workspace, *, strict: bool = False) -> list[Func
         files = workspace.list_files(pattern)
         if not files:
             return f"没有匹配 {pattern} 的文件。"
-        return "\n".join(files)
+        return cache.remember("文件列表", pattern, "\n".join(files))
 
     @function_tool(strict_mode=strict)
     def read_file(path: str) -> str:
@@ -99,7 +128,11 @@ def build_read_tools(workspace: Workspace, *, strict: bool = False) -> list[Func
         Args:
             path: 相对工作区根目录的路径，例如 "src/main.py"。
         """
-        return workspace.read_text(path)
+        return cache.remember(
+            "文件内容",
+            path,
+            workspace.read_text(path, max_chars=max_output_chars),
+        )
 
     return [list_files, read_file]
 
@@ -187,6 +220,7 @@ def build_shell_tools(
 
     return [run_command]
 __all__ = [
+    "ToolResultCache",
     "build_read_tools",
     "build_shell_tools",
     "build_write_tools",

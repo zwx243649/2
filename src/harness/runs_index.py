@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import re
 import ast
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,7 @@ SUMMARY_KEYS = (
     "test_result",
     "test_command",
     "regression_streak",
+    "execution_route",
 )
 
 
@@ -67,6 +68,7 @@ class RunSummary:
     cached_tokens: int
     total_tokens: int
     session_id: str | None = None
+    execution_route: str = "supervisor"
     # 由 state.json 是否存在推导，不存进文件，避免和实际状态脱节：
     #   completed —— 没留下状态，跑完了
     #   paused    —— 有状态且有待批准的工具调用
@@ -211,6 +213,7 @@ def summarize_run(
         duration_s=float(data.get("duration_s", 0.0) or 0.0),
         model_calls=int(data.get("model_calls", 0) or 0),
         session_id=str(session_id) if session_id else None,
+        execution_route=str(data.get("execution_route") or "supervisor"),
         status=status,
         pending=pending if isinstance(pending, list) else [],
         test_result=test_result if isinstance(test_result, dict) else None,
@@ -299,9 +302,16 @@ def load_graph_config(runs_dir: Path, run_id: str) -> dict[str, Any]:
 
     续跑必须用它 —— 配置不一致的话，待执行的工具在新建的图里根本不存在。
     """
+    from .config import HarnessConfig
+
     data = _read_payload(_safe_run_dir(Path(runs_dir), run_id))
     stored = data.get("graph_config")
-    return stored if isinstance(stored, dict) else {}
+    if not isinstance(stored, dict):
+        return {}
+    # graph_config 只应该包含 HarnessConfig 字段。旧版本曾把
+    # execution_route 之类的元数据混进来，恢复时传进构造函数会直接 TypeError。
+    allowed = {item.name for item in fields(HarnessConfig)}
+    return {key: value for key, value in stored.items() if key in allowed}
 
 
 def discard_run(runs_dir: Path, run_id: str) -> None:

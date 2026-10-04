@@ -28,6 +28,8 @@ def build_model(config: HarnessConfig) -> str | Model:
         client = AsyncOpenAI(
             api_key=config.resolved_api_key or "not-needed",
             base_url=config.base_url,
+            timeout=config.model_timeout,
+            max_retries=config.model_max_retries,
         )
         return OpenAIChatCompletionsModel(model=config.model, openai_client=client)
 

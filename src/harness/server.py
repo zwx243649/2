@@ -1,4 +1,4 @@
-"""本地只读服务：把 runs/ 用网页展示出来。
+"""本地运行控制台：把 runs/ 用网页展示并支持发起、停止、批准任务。
 
 刻意只用标准库：这是一个本地查看器，不值得为它引入 Web 框架。
 默认绑定 127.0.0.1 —— runs/ 里含完整的 prompt 和产出，不该暴露到网络上。
@@ -31,6 +31,39 @@ DEFAULT_PORT = 8765
 
 ACTION_PATTERN = re.compile(r"^/api/runs/([^/]+)/(approve|reject|resume|discard)$")
 ACTION_HEADER = "X-Harness-Action"
+
+
+def _status_payload(config: HarnessConfig) -> dict[str, Any]:
+    """给前端系统状态页用的安全配置快照，不包含 API key。"""
+    runs = list_runs(config.runs_dir)
+    sessions = list_sessions(config.runs_dir)
+    pending = sum(1 for run in runs if run.status != "completed")
+    endpoint = config.base_url.split("?", 1)[0] if config.base_url else "OpenAI Responses API"
+    return {
+        "service": "harness-console",
+        "status": "ready",
+        "model": config.model,
+        "endpoint": endpoint,
+        "tracing": config.tracing,
+        "allow_shell": config.allow_shell,
+        "max_turns": config.max_turns,
+        "worker_max_turns": config.worker_max_turns,
+        "session_item_limit": config.session_item_limit,
+        "model_timeout": config.model_timeout,
+        "model_max_retries": config.model_max_retries,
+        "routing_mode": config.routing_mode,
+        "fast_path_max_turns": config.fast_path_max_turns,
+        "dedupe_tools": config.dedupe_tools,
+        "tool_output_chars": config.tool_output_chars,
+        "workspace": str(config.workspace),
+        "runs_dir": str(config.runs_dir),
+        "run_count": len(runs),
+        "session_count": len(sessions),
+        "pending_count": pending,
+        "total_tokens": sum(run.total_tokens for run in runs),
+        "latest_run": runs[0].display_time if runs else None,
+    }
+
 
 def _progress_note(note):
     """把进度事件转成一行文字，交给任务记下来。"""
@@ -136,10 +169,12 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         try:
-            if path in ("/", "/index.html"):
+            if path in ("/", "/index.html", "/app"):
                 self._send(
                     200, (WEB_DIR / "index.html").read_bytes(), "text/html; charset=utf-8"
                 )
+            elif path == "/api/status":
+                self._json(_status_payload(self.config))
             elif path == "/api/runs":
                 self._json({"runs": [item.as_dict() for item in list_runs(self.runs_dir)]})
             elif path == "/api/sessions":

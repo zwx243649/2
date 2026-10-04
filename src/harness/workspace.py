@@ -65,16 +65,25 @@ class Workspace:
                 break
         return matches
 
-    def read_text(self, path: str, max_bytes: int = 200_000) -> str:
+    def read_text(
+        self,
+        path: str,
+        max_bytes: int = 200_000,
+        *,
+        max_chars: int | None = None,
+    ) -> str:
         target = self.resolve(path, must_exist=True)
         if target.is_dir():
             raise WorkspaceError(f"{path} 是目录，不是文件。用 list_files 查看内容。")
 
         raw = target.read_bytes()
-        truncated = len(raw) > max_bytes
+        byte_truncated = len(raw) > max_bytes
         body = raw[:max_bytes].decode("utf-8", errors="replace")
-        if truncated:
-            body += f"\n\n[已截断：只显示前 {max_bytes} 字节]"
+        char_truncated = max_chars is not None and len(body) > max_chars
+        if char_truncated:
+            body = body[:max_chars]
+        if byte_truncated or char_truncated:
+            body += f"\n\n[已截断：本次读取最多返回 {max_chars or max_bytes} 个字符/字节]"
         return body
 
     def write_text(self, path: str, content: str) -> str:

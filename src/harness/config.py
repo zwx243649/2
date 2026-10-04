@@ -9,13 +9,21 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from .sessions import DEFAULT_ITEM_LIMIT as DEFAULT_SESSION_ITEM_LIMIT
+
 DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_MAX_TURNS = 12
 DEFAULT_WORKER_MAX_TURNS = 8
+DEFAULT_MODEL_TIMEOUT = 120.0
+DEFAULT_MODEL_MAX_RETRIES = 1
+DEFAULT_ROUTING_MODE = "auto"
+DEFAULT_FAST_PATH_MAX_TURNS = 8
+DEFAULT_TOOL_OUTPUT_CHARS = 24_000
 DEFAULT_SHELL_TIMEOUT = 60.0
 DEFAULT_ENV_FILE = ".env"
 TRACING_MODES = ("local", "openai", "off")
 THINKING_MODES = ("default", "disabled")
+ROUTING_MODES = ("auto", "off", "always")
 
 
 def _project_env_file() -> Path | None:
@@ -56,6 +64,13 @@ class HarnessConfig:
     runs_dir: Path = Path("./runs")
     max_turns: int = DEFAULT_MAX_TURNS
     worker_max_turns: int = DEFAULT_WORKER_MAX_TURNS
+    session_item_limit: int = DEFAULT_SESSION_ITEM_LIMIT
+    model_timeout: float = DEFAULT_MODEL_TIMEOUT
+    model_max_retries: int = DEFAULT_MODEL_MAX_RETRIES
+    routing_mode: str = DEFAULT_ROUTING_MODE
+    fast_path_max_turns: int = DEFAULT_FAST_PATH_MAX_TURNS
+    dedupe_tools: bool = False
+    tool_output_chars: int = DEFAULT_TOOL_OUTPUT_CHARS
     allow_shell: bool = False
     approve_shell: bool = True
     shell_timeout: float = DEFAULT_SHELL_TIMEOUT
@@ -74,6 +89,18 @@ class HarnessConfig:
             raise ValueError("max_turns 必须 >= 1")
         if self.worker_max_turns < 1:
             raise ValueError("worker_max_turns 必须 >= 1")
+        if self.session_item_limit < 0:
+            raise ValueError("session_item_limit 必须 >= 0")
+        if self.model_timeout <= 0:
+            raise ValueError("model_timeout 必须 > 0")
+        if self.model_max_retries < 0:
+            raise ValueError("model_max_retries 必须 >= 0")
+        if self.routing_mode not in ROUTING_MODES:
+            raise ValueError(f"routing_mode 必须是 {ROUTING_MODES} 之一，收到 {self.routing_mode!r}")
+        if self.fast_path_max_turns < 1:
+            raise ValueError("fast_path_max_turns 必须 >= 1")
+        if self.tool_output_chars < 1_000:
+            raise ValueError("tool_output_chars 必须 >= 1000")
         if self.tracing not in TRACING_MODES:
             raise ValueError(f"tracing 必须是 {TRACING_MODES} 之一，收到 {self.tracing!r}")
         if self.thinking not in THINKING_MODES:
@@ -103,6 +130,23 @@ class HarnessConfig:
             "max_turns": _env_int("HARNESS_MAX_TURNS", DEFAULT_MAX_TURNS),
             "worker_max_turns": _env_int(
                 "HARNESS_WORKER_MAX_TURNS", DEFAULT_WORKER_MAX_TURNS
+            ),
+            "session_item_limit": _env_int(
+                "HARNESS_SESSION_ITEM_LIMIT", DEFAULT_SESSION_ITEM_LIMIT
+            ),
+            "model_timeout": _env_float("HARNESS_MODEL_TIMEOUT", DEFAULT_MODEL_TIMEOUT),
+            "model_max_retries": _env_int(
+                "HARNESS_MODEL_MAX_RETRIES", DEFAULT_MODEL_MAX_RETRIES
+            ),
+            "routing_mode": (os.getenv("HARNESS_ROUTING") or DEFAULT_ROUTING_MODE)
+            .strip()
+            .lower(),
+            "fast_path_max_turns": _env_int(
+                "HARNESS_FAST_PATH_MAX_TURNS", DEFAULT_FAST_PATH_MAX_TURNS
+            ),
+            "dedupe_tools": _env_bool("HARNESS_DEDUPE_TOOLS", False),
+            "tool_output_chars": _env_int(
+                "HARNESS_TOOL_OUTPUT_CHARS", DEFAULT_TOOL_OUTPUT_CHARS
             ),
             "allow_shell": _env_bool("HARNESS_ALLOW_SHELL", False),
             "approve_shell": _env_bool("HARNESS_APPROVE_SHELL", True),

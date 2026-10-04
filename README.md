@@ -43,12 +43,12 @@ src/harness/
   runner.py     组装 + 运行 + 落盘产物
   runs_index.py runs/ 的数据层（纯数据，可单测）
   usage.py      token 消耗统计（写入方和读取方共用，避免循环依赖）
-  sessions.py   会话：对话历史持久化 + 会话名校验
-  server.py     本地只读服务（标准库，无 Web 框架）
-  web/          运行浏览器的单页前端
+  sessions.py   会话：对话历史持久化 + 长会话折叠 + 会话名校验
+  server.py     本地运行控制台（标准库，无 Web 框架）
+  web/          运行控制台的单页前端
   cli.py        命令行入口
   testing.py    ScriptedModel，离线测试编排用
-tests/          145 个测试，全部离线可跑
+tests/          222 个测试，全部离线可跑
 examples/       offline_demo.py
 ```
 
@@ -67,8 +67,13 @@ Copy-Item .env.example .env    # 然后填 HARNESS_API_KEY
 .\.venv\Scripts\python.exe -m harness "在工作区写一个 hello.py 并附上 README"
 ```
 
-常用参数：`--workspace` `--model` `--base-url` `--max-turns` `--allow-shell` `--tracing` `-v`。
+常用参数：`--workspace` `--model` `--base-url` `--max-turns` `--session-items`
+`--model-timeout` `--model-retries` `--routing` `--fast-turns`
+`--tool-output-chars` `--allow-shell` `--tracing` `-v`。
 加 `--quiet` 可以关掉实时进度，只在结束时打印报告。
+
+模型请求默认在空闲 120 秒后中断，失败最多重试 1 次；网络端点挂起时不会
+无限等待。对应环境变量是 `HARNESS_MODEL_TIMEOUT` / `HARNESS_MODEL_MAX_RETRIES`。
 
 多轮追问用 `--session`，看历史用 `--list-sessions`：
 
@@ -143,15 +148,23 @@ HARNESS_MODEL=qwen3:8b
 
 进度写 stderr、报告写 stdout，所以 `harness "任务" > result.txt` 只会重定向报告。
 
-## 运行浏览器
+## 网页控制台
 
 ```powershell
-.\.venv\Scripts\python.exe -m harness --serve        # 默认 http://127.0.0.1:8765
+.\.venv\Scripts\python.exe -m harness --serve        # 默认 http://localhost:8765
 .\.venv\Scripts\python.exe -m harness --serve --port 9000
 ```
 
-左边是历史运行列表（时间 / 调用次数 / tokens / 耗时），点开看详情：
-结论、`委派轨迹`、`内部 span`，以及完整的消耗拆分。
+打开后先看到 Landing Page 和服务状态，进入控制台后是
+`Dashboard / Sessions / Settings` 三个视图。Dashboard 左侧用卡片展示历史运行
+（状态、时间、调用次数、tokens、耗时），右侧展示：
+
+- Markdown 渲染后的结论，支持代码块、表格、列表和基础语法高亮
+- 运行详情指标卡和 token 消耗环形图 / 柱状图
+- `委派轨迹`、`内部 span`，以及待批准 / 停止运行的恢复操作
+
+输入框带最近提示词下拉，登录页和页面文案都不展示 `127.0.0.1`；本地服务仍只
+绑定 loopback，不对外暴露。
 
 **调提示词时最有用的是「设为对比基线」**：把某一次钉成基线，再点别的运行，
 每个指标后面会直接显示涨跌百分比。比如把优化前的 hello.py 那次设为基线，
@@ -200,6 +213,20 @@ HARNESS_MODEL=qwen3:8b
 一个需要注意的边界：**会话历史属于 supervisor，worker 仍然是无状态的。**
 worker 拿不到 supervisor 的对话，所以 supervisor 必须把相关背景写进委派内容里
 ——这正是它提示词里「委派必须自包含」那条规则。
+
+### 长会话：折叠旧上下文，不删历史
+
+多轮会话如果一直把所有历史喂回去，任务越聊越贵，最后一定会撞上模型窗口。
+默认最多交给模型 80 条会话记录；超过之后：
+
+- 旧记录被压成一条**本地规则生成的摘要**（原始目标、较早用户消息、条目构成），
+  不额外调用模型，所以这一步本身不花 token。
+- 最近的记录仍按原文保留，并从用户消息或完整工具调用处开始截断，
+  不会留下「只有工具输出、找不到对应调用」的孤立条目。
+- `runs/sessions.db` 里的原始历史一条都不会删。摘要只是给模型看的视图。
+
+可以用 `--session-items 40` 收紧，或设成 `0` 完全关闭。想让摘要质量更高，
+后续可以把它换成一次显式的模型压缩调用；现在这版优先保证零额外成本和确定性。
 
 ## 审批门
 
@@ -484,6 +511,45 @@ harness 的消耗不取决于任务本身，而取决于**编排有多克制**�
 - 关掉 `HARNESS_ALLOW_SHELL`（默认就是关的）
 - 调小 `HARNESS_MAX_TURNS` / `HARNESS_WORKER_MAX_TURNS`
 
+## 速度与上下文优化
+
+这轮把优化落成了三个可测的机制：
+
+- **动态任务路由。** 小型、边界清楚的单点任务直接交给 coder，不再启动
+  researcher / reviewer。涉及 `inclusive`、`recursive`、`any iterable`、
+  `invalid` 这类高风险契约时，自动回退 supervisor，避免为了省调用牺牲正确率。
+- **重复读取折叠（实验性，默认关闭）。** 它能把同一上下文的重复文件内容换成
+  「内容未变化」，但 worker 上下文彼此隔离，共享缓存会让 coder 看不到
+  researcher 读过的正文。实测触发过误判后改为 `--dedupe-reads` 显式开启。
+- **工具输出预算。** 单次 `read_file` 默认最多返回 24k 字符，避免一个大文件
+  一次吃满上下文；可通过 `--tool-output-chars` 调整。
+
+30 个评估用例上的实测对比（去重实验开启时）：
+
+| 调度策略 | Pass@1 | 平均 tokens | 平均调用 | 平均耗时 | 平均成本 |
+|---|---:|---:|---:|---:|---:|
+| 关闭路由，完整 supervisor | 93% | 19,519 | 10.9 | 17.9s | 0.0118 元 |
+| 总是快速路径 | 83% | **9,243** | **5.3** | **9s** | **0.0035 元** |
+| 默认 guarded auto | **97%** | 16,574 | 8.6 | 15s | 0.0082 元 |
+
+默认策略不是二选一：18 个低风险任务走快速路径，12 个高风险任务走完整编排。
+结果比完整 supervisor 更准，同时 token 少 15%、调用少 21%、成本少 31%。
+想极限压成本可以用 `--routing always`，想保守调试用 `--routing off`。
+
+## 评估结果
+
+`evals/` 里目前有 30 个带隐藏测试的修复任务。DeepSeek Flash 连续跑两轮，
+共 60 个样本：
+
+- **Pass@1 55/60 = 92%**，95% 置信区间 **[82%, 96%]**，区间宽 14%
+- **0/60 修改测试文件**；3/60 出现改 docstring 的规格漂移
+- 平均 20,028 tokens、11.0 次模型调用、17.9 秒、0.0121 元/用例
+- 两轮总成本 **0.7253 元**
+- 评估器默认 3 进程并行，完整一轮预计从约 9 分钟压到 3 到 4 分钟
+
+失败集中在计数边界、重复空格换行和嵌套字典合并。完整方法和失败现场见
+`evals/README.md` 与 `evals/_out/`。
+
 ## 测试
 
 ```powershell
@@ -491,8 +557,8 @@ $env:PYTHONUTF8=1
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-10 个测试全部离线运行，不联网、不花钱，覆盖路径沙箱、工具权限边界、
-委派链路、真实文件写入、产物落盘和 span 采集。
+222 个测试全部离线运行，不联网、不花钱，覆盖路径沙箱、工具权限边界、
+委派链路、真实文件写入、产物落盘、会话折叠和 span 采集。
 
 ## 目前的局限
 
@@ -502,8 +568,8 @@ $env:PYTHONUTF8=1
   还在 `state.json` 里，可以 `--resume`）。
 - 网页发起的运行用的是服务的配置，页面上不能临时改模型或开 shell。
 - 没有并发，worker 是串行逐个调用的。
-- 运行浏览器是**只读**的：能看历史、能对比，但还不能从页面发起任务、叫停或干预。
-  这些要先补后端能力（会话持久化 → 可中断 → 审批门），不是前端的事。
+- 长会话折叠是**规则摘要**，不是语义摘要：它能控制体积，但不会像模型压缩
+  那样重写复杂结论。完整原文仍在 `sessions.db`。
 - 只有 token 统计，没有按人民币折算成本。
 - 工作区沙箱只管文件读写，管不住进程：开了 `--allow-shell` 后 agent 仍能在
   本机执行任意命令（有超时和拒绝列表，但那是防手滑，不是隔离）。

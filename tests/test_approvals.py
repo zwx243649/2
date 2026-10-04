@@ -17,6 +17,7 @@ from harness.runs_index import (
     list_runs,
     load_graph_config,
 )
+from harness.runner import stored_execution_route
 from harness.testing import ScriptedModel, text_response, tool_call_response
 
 MARKER_CMD = "echo hi > marker.txt"
@@ -27,6 +28,7 @@ def make_config(tmp_path, **overrides) -> HarnessConfig:
         "workspace": tmp_path / "ws",
         "runs_dir": tmp_path / "runs",
         "allow_shell": True,
+        "routing_mode": "off",
     }
     defaults.update(overrides)
     return HarnessConfig(**defaults)
@@ -246,3 +248,40 @@ def test_load_graph_config_returns_empty_for_old_records(tmp_path):
     )
 
     assert load_graph_config(runs_dir, "20260101-090000") == {}
+
+
+def test_load_graph_config_filters_non_config_metadata(tmp_path):
+    """旧记录把 execution_route 混进 graph_config，恢复时不能当构造参数。"""
+    runs_dir = tmp_path / "runs"
+    run_dir = runs_dir / "20260101-090000"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "goal": "恢复旧记录",
+                "graph_config": {
+                    "allow_shell": True,
+                    "max_turns": 12,
+                    "execution_route": "supervisor",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    stored = load_graph_config(runs_dir, "20260101-090000")
+
+    assert "execution_route" not in stored
+    assert stored["allow_shell"] is True
+    assert HarnessConfig(workspace=tmp_path / "ws").with_overrides(
+        **stored
+    ).allow_shell is True
+
+
+def test_stored_execution_route_reads_new_and_legacy_payloads():
+    assert stored_execution_route({"execution_route": "coder"}) == "coder"
+    assert stored_execution_route(
+        {"graph_config": {"execution_route": "coder"}}
+    ) == "coder"
+    assert stored_execution_route({}) == "supervisor"

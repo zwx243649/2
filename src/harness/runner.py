@@ -22,12 +22,18 @@ from agents import (
     set_tracing_disabled,
 )
 
-from .agents import apply_strict_policy, build_supervisor, build_workers
+from .agents import (
+    apply_strict_policy,
+    build_fast_path_agent,
+    build_supervisor,
+    build_workers,
+)
 from .cancel import CancelToken
 from .config import HarnessConfig
 from .progress import Emitter, ProgressHooks
 from .provider import build_model, build_model_settings
 from .runs_index import SUMMARY_FILENAME, build_summary, previous_test_result
+from .routing import choose_execution_route
 from .sessions import open_conversation
 from .testresults import ResultTracker
 from .tools import build_read_tools, build_shell_tools, build_write_tools
@@ -48,6 +54,8 @@ GRAPH_CONFIG_KEYS = (
     "strict_tools",
     "max_turns",
     "worker_max_turns",
+    "routing_mode",
+    "fast_path_max_turns",
 )
 
 
@@ -129,6 +137,19 @@ def resume_turn_budget(state_payload: dict[str, Any], base: int) -> int:
     return base + max(used, 0)
 
 
+def stored_execution_route(original: dict[str, Any]) -> str:
+    """读取历史运行使用的执行路径，兼容新旧两种落盘格式。"""
+    route = original.get("execution_route")
+    if route in {"coder", "supervisor"}:
+        return str(route)
+    stored_graph = original.get("graph_config")
+    if isinstance(stored_graph, dict):
+        legacy = stored_graph.get("execution_route")
+        if legacy in {"coder", "supervisor"}:
+            return str(legacy)
+    return "supervisor"
+
+
 def render_transcript(entries: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for index, entry in enumerate(entries, start=1):
@@ -164,6 +185,7 @@ class RunOutcome:
     pending: list[dict[str, Any]] = field(default_factory=list)
     resumed_from: str | None = None
     stop_reason: str | None = None
+    execution_route: str = "supervisor"
 
     @property
     def model_calls(self) -> int:
@@ -258,7 +280,12 @@ class Harness:
         self.workspace = Workspace(config.workspace)
         self.model = model if model is not None else build_model(config)
 
-        read_tools = build_read_tools(self.workspace, strict=config.strict_tools)
+        read_tools = build_read_tools(
+            self.workspace,
+            strict=config.strict_tools,
+            dedupe=config.dedupe_tools,
+            max_output_chars=config.tool_output_chars,
+        )
         write_tools = build_write_tools(self.workspace, strict=config.strict_tools)
         shell_tools = (
             build_shell_tools(config, self.workspace, self.test_results)
@@ -270,13 +297,18 @@ class Harness:
         self.workers = build_workers(
             self.model, read_tools, write_tools, shell_tools, model_settings
         )
+        self.fast_agent = build_fast_path_agent(
+            self.model, self.workers, model_settings
+        )
         self.progress.delegation_tools = {worker.name for worker in self.workers}
         self.supervisor = build_supervisor(
             config, self.model, self.workers, model_settings, self.progress
         )
 
         # 必须在 as_tool() 之后统一覆盖，否则 worker 工具会带着 strict=True 发出去
-        apply_strict_policy([self.supervisor, *self.workers], config.strict_tools)
+        apply_strict_policy(
+            [self.supervisor, self.fast_agent, *self.workers], config.strict_tools
+        )
 
     # ---- 追踪 ----
 
@@ -315,11 +347,22 @@ class Harness:
             raise ValueError("goal 不能为空")
 
         session = self._conversation(session_id) if session_id else None
+        decision = choose_execution_route(
+            goal,
+            self.workspace,
+            mode=self.config.routing_mode,
+            has_session=session_id is not None,
+        )
+        agent = self.fast_agent if decision.route == "coder" else self.supervisor
         self.processor.reset()
         started = time.perf_counter()
 
         result, cancelled = await self._execute(
-            goal, session=session, cancel_token=cancel_token, on_event=on_event
+            agent,
+            goal,
+            session=session,
+            cancel_token=cancel_token,
+            on_event=on_event,
         )
 
         outcome = self._build_outcome(
@@ -328,6 +371,7 @@ class Harness:
             cancelled,
             time.perf_counter() - started,
             session_id=session_id,
+            execution_route=decision.route,
         )
         return self._finish(outcome, result)
 
@@ -385,6 +429,8 @@ class Harness:
 
         original = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
         self._check_graph_config(original)
+        stored_route = stored_execution_route(original)
+        agent = self.fast_agent if stored_route == "coder" else self.supervisor
 
         # 把上一次的测试结果捞回来，否则这一轮不知道「之前是多少」，
         # 也就判断不出有没有变差。
@@ -400,10 +446,15 @@ class Harness:
 
         state_text = state_path.read_text(encoding="utf-8")
         state_payload = json.loads(state_text)
-        state_payload["max_turns"] = resume_turn_budget(
-            state_payload, self.config.max_turns
+        turn_budget = (
+            self.config.fast_path_max_turns
+            if stored_route == "coder"
+            else self.config.max_turns
         )
-        state = await RunState.from_json(self.supervisor, state_payload)
+        state_payload["max_turns"] = resume_turn_budget(
+            state_payload, turn_budget
+        )
+        state = await RunState.from_json(agent, state_payload)
 
         for item in state.get_interruptions():
             if approve:
@@ -414,6 +465,7 @@ class Harness:
         self.processor.reset()
         started = time.perf_counter()
         result, cancelled = await self._execute(
+            agent,
             state,
             session=None,
             cancel_token=cancel_token,
@@ -430,11 +482,13 @@ class Harness:
             time.perf_counter() - started,
             session_id=original.get("session_id"),
             resumed_from=run_id,
+            execution_route=stored_route,
         )
         return self._finish(outcome, result)
 
     async def _execute(
         self,
+        agent: Any,
         agent_input: Any,
         *,
         session: Any,
@@ -452,10 +506,15 @@ class Harness:
         self._active_cancel = token
         self.progress.set_emitter(on_event)
         try:
+            max_turns = (
+                self.config.fast_path_max_turns
+                if agent is self.fast_agent
+                else self.config.max_turns
+            )
             result = Runner.run_streamed(
-                self.supervisor,
+                agent,
                 agent_input,
-                max_turns=self.config.max_turns,
+                max_turns=max_turns,
                 hooks=self.progress,
                 session=session,
                 run_config=RunConfig(
@@ -490,6 +549,7 @@ class Harness:
         *,
         session_id: str | None = None,
         resumed_from: str | None = None,
+        execution_route: str = "supervisor",
     ) -> RunOutcome:
         interruptions = list(result.interruptions)
         if interruptions:
@@ -512,6 +572,7 @@ class Harness:
             pending=describe_interruptions(interruptions),
             resumed_from=resumed_from,
             stop_reason=self.test_results.stop_reason if cancelled else None,
+            execution_route=execution_route,
         )
 
     def _finish(self, outcome: RunOutcome, result: RunResult) -> RunOutcome:
@@ -537,7 +598,11 @@ class Harness:
         """同一个会话只打开一次，避免重复建连接。"""
         session = self._conversations.get(session_id)
         if session is None:
-            session = open_conversation(session_id, self.config.sessions_db)
+            session = open_conversation(
+                session_id,
+                self.config.sessions_db,
+                max_items=self.config.session_item_limit,
+            )
             self._conversations[session_id] = session
         return session
 
@@ -586,6 +651,7 @@ class Harness:
             "status": outcome.status,
             "pending": outcome.pending,
             "resumed_from": outcome.resumed_from,
+            "execution_route": outcome.execution_route,
             "graph_config": self._graph_config(),
             "test_result": self.test_results.latest,
             "test_command": self.test_results.latest_command,

@@ -1,7 +1,7 @@
 """token 消耗统计。
 
 独立成模块是为了让「写入方」（runner）和「读取方」（runs_index）都能引用，
-而不产生循环依赖；顺带让只读的运行浏览器不必加载整个 agents SDK。
+而不产生循环依赖；顺带让命令行列表不必加载整个 agents SDK。
 """
 
 from __future__ import annotations

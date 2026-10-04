@@ -8,7 +8,7 @@ import sys
 from typing import Any
 
 from .cancel import CancelToken
-from .config import TRACING_MODES, HarnessConfig
+from .config import ROUTING_MODES, TRACING_MODES, HarnessConfig
 from .console import force_utf8_stdout
 from .server import DEFAULT_PORT
 from .server import serve as serve_runs
@@ -186,7 +186,8 @@ def _serve(config: HarnessConfig, port: int) -> int:
         return 1
 
     host, bound_port = httpd.server_address[:2]
-    print(f"运行浏览器：http://{host}:{bound_port}")
+    display_host = "localhost" if host in {"127.0.0.1", "::1"} else host
+    print(f"运行控制台：http://{display_host}:{bound_port}")
     print(f"数据目录　：{config.runs_dir}")
     print("按 Ctrl+C 停止。")
     try:
@@ -212,6 +213,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="OpenAI 兼容端点；设置后自动切到 Chat Completions",
     )
     parser.add_argument("--max-turns", dest="max_turns", type=int, help="supervisor 最大轮数")
+    parser.add_argument(
+        "--session-items",
+        dest="session_item_limit",
+        type=int,
+        help="会话最多传给模型的条目数（默认 80，0 表示不折叠）",
+    )
+    parser.add_argument(
+        "--model-timeout",
+        dest="model_timeout",
+        type=float,
+        help="单次模型请求的空闲超时秒数（默认 120）",
+    )
+    parser.add_argument(
+        "--model-retries",
+        dest="model_max_retries",
+        type=int,
+        help="模型请求失败后的重试次数（默认 1）",
+    )
+    parser.add_argument(
+        "--routing",
+        dest="routing_mode",
+        choices=ROUTING_MODES,
+        help="任务路由：auto（默认）/ off / always",
+    )
+    parser.add_argument(
+        "--fast-turns",
+        dest="fast_path_max_turns",
+        type=int,
+        help="快速路径最大轮数（默认 8）",
+    )
+    parser.add_argument(
+        "--no-dedupe",
+        dest="dedupe_tools",
+        action="store_const",
+        const=False,
+        default=None,
+        help="关闭重复读取折叠",
+    )
+    parser.add_argument(
+        "--dedupe-reads",
+        dest="dedupe_tools",
+        action="store_const",
+        const=True,
+        default=None,
+        help="实验性开启重复读取折叠（默认关闭）",
+    )
+    parser.add_argument(
+        "--tool-output-chars",
+        dest="tool_output_chars",
+        type=int,
+        help="单次文件读取最多返回的字符数（默认 24000）",
+    )
     parser.add_argument(
         "--allow-shell",
         dest="allow_shell",
@@ -240,13 +293,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--serve",
         action="store_true",
-        help="启动运行浏览器（只读查看 runs/ 里的历史），不执行任务",
+        help="启动运行控制台（查看历史、发起/停止/批准任务）",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=DEFAULT_PORT,
-        help=f"运行浏览器的端口（默认 {DEFAULT_PORT}）",
+        help=f"运行控制台的端口（默认 {DEFAULT_PORT}）",
     )
     parser.add_argument(
         "--session",
@@ -312,6 +365,11 @@ def _describe(harness: Any) -> str:
         f"  runs_dir   : {config.runs_dir}",
         f"  tracing    : {config.tracing}",
         f"  allow_shell: {config.allow_shell}",
+        f"  session_items: {config.session_item_limit or '(不折叠)'}",
+        f"  model_timeout: {config.model_timeout}s / retries {config.model_max_retries}",
+        f"  routing    : {config.routing_mode} / fast turns {config.fast_path_max_turns}",
+        f"  dedupe read: {config.dedupe_tools}",
+        f"  tool output: {config.tool_output_chars} chars",
         f"  env_file   : {config.env_file or '(未使用)'}",
         "",
         "supervisor 可委派的成员",
@@ -339,6 +397,13 @@ def main(argv: list[str] | None = None) -> int:
         "base_url",
         "workspace",
         "max_turns",
+        "session_item_limit",
+        "model_timeout",
+        "model_max_retries",
+        "routing_mode",
+        "fast_path_max_turns",
+        "dedupe_tools",
+        "tool_output_chars",
         "allow_shell",
         "tracing",
         "save_artifacts",

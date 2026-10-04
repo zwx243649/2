@@ -88,6 +88,23 @@ CODER_INSTRUCTIONS = """\
 - 未完成：没做到的及原因（没有就写「无」）
 """
 
+FAST_PATH_INSTRUCTIONS = """\
+你是 harness 的快速执行工程师。这个任务已经过本地路由判断，属于小型、边界清楚的
+单点任务，所以不会经过 supervisor，也没有 researcher / reviewer。
+
+工作方式：
+1. 先看清现状（list_files / read_file），直接定位和任务有关的最少文件。
+2. 改已有文件用 edit_file；新建文件才用 write_file。不要顺手重构无关文件。
+3. 需要验证时，把命令合并成一条；run_command 可能触发人工审批。
+4. 同一个文件不要反复读取；读取工具会主动折叠重复内容。
+5. 结束前逐条核对 docstring 里的边界、异常类型、不可变性和空输入要求；
+   相关模块都要检查，不能只让可见测试通过。
+6. 如果事实和任务假设冲突，停下来说明原因，不要改测试或伪造通过。
+
+输出要求：中文，6 行以内，说清「产出、验证、未完成」三件事。
+"""
+
+
 REVIEWER_INSTRUCTIONS = """\
 你是团队里的评审员。你只读不写，负责挑毛病而不是夸奖。
 
@@ -155,6 +172,23 @@ def build_workers(
         tools=list(read_tools),
     )
     return [researcher, coder, reviewer]
+
+
+def build_fast_path_agent(
+    model: Any,
+    workers: list[Agent],
+    model_settings: ModelSettings | None = None,
+) -> Agent:
+    """构造不走 supervisor 的 coder 快速路径。"""
+    coder = next(worker for worker in workers if worker.name == "coder")
+    return Agent(
+        name="coder",
+        handoff_description="快速路径：直接完成小型、边界清楚的任务。",
+        instructions=FAST_PATH_INSTRUCTIONS,
+        model=model,
+        model_settings=model_settings or coder.model_settings,
+        tools=list(coder.tools),
+    )
 
 
 def build_supervisor(

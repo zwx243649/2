@@ -313,6 +313,7 @@ async def test_run_is_cancelled_after_consecutive_regressions(tmp_path):
         workspace=tmp_path / "ws",
         runs_dir=tmp_path / "runs",
         allow_shell=True,
+        routing_mode="off",
         # 关掉逐条审批，否则命令还没执行运行就先暂停了，tracker 拿不到输出
         approve_shell=False,
     )
